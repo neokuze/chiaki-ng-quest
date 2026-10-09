@@ -1,0 +1,95 @@
+name: Release (Quest)
+
+# Push a tag like v1.0.0 on main: builds the 2D panel app (main) and the
+# immersive app (immersive branch) and publishes both APKs in one release.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to create or update
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        include:
+          - branch: main
+            apk: chiaki-quest
+          - branch: immersive
+            apk: chiaki-quest-immersive
+    env:
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ matrix.branch }}
+
+      - name: Checkout submodules
+        run: >
+          git submodule update --init --depth 1
+          android/app/src/main/cpp/oboe
+          third-party/curl
+          third-party/gf-complete
+          third-party/jerasure
+          third-party/nanopb
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+          pip install --upgrade protobuf
+
+      - name: Install NDK and CMake
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358" "cmake;3.22.1"
+
+      - name: Set up signing
+        if: env.KEYSTORE_BASE64 != ''
+        run: |
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/chiaki-quest.jks"
+          {
+            echo "chiakiKeystore=$RUNNER_TEMP/chiaki-quest.jks"
+            echo "chiakiKeystorePW=$KEYSTORE_PASSWORD"
+            echo "chiakiKeyAlias=$KEY_ALIAS"
+            echo "chiakiKeyPW=$KEYSTORE_PASSWORD"
+          } > android/local.properties
+
+      - name: Build APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: cp android/app/build/outputs/apk/debug/*.apk "${{ matrix.apk }}.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.apk }}
+          path: ${{ matrix.apk }}.apk
+
+  release:
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          files: '*.apk'
