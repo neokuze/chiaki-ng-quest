@@ -3,6 +3,7 @@
 #ifndef CHIAKI_JNI_VIDEO_DECODER_H
 #define CHIAKI_JNI_VIDEO_DECODER_H
 
+#include <media/NdkImageReader.h>
 #include <jni.h>
 
 #include <chiaki/thread.h>
@@ -20,6 +21,8 @@ typedef struct android_chiaki_video_decoder_t
 	uint64_t timestamp_cur;
 	ChiakiThread output_thread;
 	bool shutdown_output;
+	volatile bool render_output;
+	AImageReader *dummy_reader;
 	int32_t target_width;
 	int32_t target_height;
 	ChiakiCodec target_codec;

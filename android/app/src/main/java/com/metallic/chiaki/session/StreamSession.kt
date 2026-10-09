@@ -47,14 +47,18 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
 		//surfaceTexture?.release()
 	}
 
+	private var paused = false
+
 	fun pause()
 	{
-		// Keep the session alive while paused (e.g. headset taken off on Quest).
-		// Video output detaches with the surface; shutdown happens when the ViewModel is cleared.
+		// Keep the session alive while paused (e.g. headset taken off on Quest) so the
+		// console doesn't drop it; shutdown happens when the ViewModel is cleared.
+		paused = true
 	}
 
 	fun resume()
 	{
+		paused = false
 		if(session != null)
 			return
 		try

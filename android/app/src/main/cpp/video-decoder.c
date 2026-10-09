@@ -7,6 +7,7 @@
 #include <media/NdkMediaCodec.h>
 #include <media/NdkMediaFormat.h>
 #include <android/native_window_jni.h>
+#include <media/NdkImageReader.h>
 
 #include <string.h>
 
@@ -23,6 +24,9 @@ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *dec
 	decoder->target_height = target_height;
 	decoder->target_codec = codec;
 	decoder->shutdown_output = false;
+	decoder->render_output = true;
+	decoder->window = NULL;
+	decoder->dummy_reader = NULL;
 	return chiaki_mutex_init(&decoder->codec_mutex, false);
 }
 
@@ -54,6 +58,8 @@ void android_chiaki_video_decoder_fini(AndroidChiakiVideoDecoder *decoder)
 {
 	if(decoder->codec)
 		kill_decoder(decoder);
+	if(decoder->dummy_reader)
+		AImageReader_delete(decoder->dummy_reader);
 	chiaki_mutex_fini(&decoder->codec_mutex);
 }
 
@@ -63,12 +69,27 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 
 	if(!surface)
 	{
+		// Keep the decoder alive and park its output on an invisible surface, so it never
+		// loses its reference frames (headset taken off on Quest). Frames are dropped meanwhile.
 		if(decoder->codec)
 		{
-			kill_decoder(decoder);
-			CHIAKI_LOGI(decoder->log, "Decoder shut down after surface was removed");
+			if(!decoder->dummy_reader)
+				AImageReader_new(decoder->target_width, decoder->target_height, AIMAGE_FORMAT_PRIVATE, 2, &decoder->dummy_reader);
+			ANativeWindow *dummy = NULL;
+			if(decoder->dummy_reader)
+				AImageReader_getWindow(decoder->dummy_reader, &dummy);
+			decoder->render_output = false;
+			if(dummy && AMediaCodec_setOutputSurface(decoder->codec, dummy) == AMEDIA_OK)
+			{
+				if(decoder->window)
+					ANativeWindow_release(decoder->window);
+				decoder->window = NULL;
+				CHIAKI_LOGI(decoder->log, "Surface removed, decoder parked on dummy surface");
+			}
+			else
+				CHIAKI_LOGE(decoder->log, "Failed to park decoder on dummy surface");
 		}
-		return;
+		goto beach;
 	}
 
 	if(decoder->codec)
@@ -77,8 +98,10 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 		CHIAKI_LOGI(decoder->log, "Video decoder already initialized, swapping surface");
 		ANativeWindow *new_window = surface ? ANativeWindow_fromSurface(env, surface) : NULL;
 		AMediaCodec_setOutputSurface(decoder->codec, new_window);
-		ANativeWindow_release(decoder->window);
+		if(decoder->window)
+			ANativeWindow_release(decoder->window);
 		decoder->window = new_window;
+		decoder->render_output = true;
 #else
 		CHIAKI_LOGE(decoder->log, "Video Decoder already initialized");
 #endif
@@ -195,7 +218,7 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
 		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, -1);
 		if(status >= 0)
 		{
-			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, info.size != 0);
+			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, info.size != 0 && decoder->render_output);
 			if(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
 			{
 				CHIAKI_LOGI(decoder->log, "AMediaCodec reported EOS");

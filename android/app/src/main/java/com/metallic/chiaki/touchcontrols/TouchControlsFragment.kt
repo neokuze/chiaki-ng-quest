@@ -69,6 +69,17 @@ class DefaultTouchControlsFragment : TouchControlsFragment()
 		binding.shareButtonView.buttonPressedCallback = buttonStateChanged(ControllerState.BUTTON_SHARE)
 		binding.psButtonView.buttonPressedCallback = buttonStateChanged(ControllerState.BUTTON_PS)
 
+		// Quest: a physical controller is used, so only keep the PS button on screen.
+		// INVISIBLE (not GONE) keeps the constraint layout intact and stops touch dispatch.
+		(binding.root as ViewGroup).let { root ->
+			for(i in 0 until root.childCount)
+			{
+				val child = root.getChildAt(i)
+				if(child !== binding.psButtonView)
+					child.visibility = View.INVISIBLE
+			}
+		}
+
 		binding.l2ButtonView.buttonPressedCallback = { ownControllerState = ownControllerState.copy().apply { l2State = if(it) 255U else 0U } }
 		binding.r2ButtonView.buttonPressedCallback = { ownControllerState = ownControllerState.copy().apply { r2State = if(it) 255U else 0U } }
 
