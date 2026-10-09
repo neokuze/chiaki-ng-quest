@@ -26,6 +26,7 @@ android {
 
     defaultConfig {
         applicationId "com.metallic.chiaki"
+        applicationIdSuffix ".immersive"
         minSdk 26
         targetSdk 35
         versionCode 12

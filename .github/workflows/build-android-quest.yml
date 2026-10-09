@@ -2,7 +2,7 @@ name: Build Android (Quest)
 
 on:
   push:
-    branches: [main]
+    branches: [main, immersive]
   pull_request:
   workflow_dispatch:
 
