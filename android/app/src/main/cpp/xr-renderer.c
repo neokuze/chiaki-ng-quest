@@ -30,6 +30,10 @@
 #define BTN_MOON     (1 << 1)
 #define BTN_BOX      (1 << 2)
 #define BTN_PYRAMID  (1 << 3)
+#define BTN_DPAD_LEFT  (1 << 4)
+#define BTN_DPAD_RIGHT (1 << 5)
+#define BTN_DPAD_UP    (1 << 6)
+#define BTN_DPAD_DOWN  (1 << 7)
 #define BTN_L1       (1 << 8)
 #define BTN_R1       (1 << 9)
 #define BTN_L3       (1 << 10)
@@ -37,6 +41,9 @@
 #define BTN_OPTIONS  (1 << 12)
 #define BTN_SHARE    (1 << 13)
 #define BTN_PS       (1 << 15)
+
+#define DPAD_THRESHOLD 0.5f
+#define OPTIONS_TAP_FRAMES 8 // ~90 ms at 90 Hz, long enough for the console to see the press
 
 #define SCREEN_WIDTH_M 3.2f
 #define SCREEN_DISTANCE_M 2.4f
@@ -72,6 +79,9 @@ typedef struct XrRenderer
 
 	XrActionSet action_set;
 	XrAction actions[A_COUNT];
+	bool menu_held;
+	bool menu_combo;
+	int options_frames;
 } XrRenderer;
 
 #define XR_CHECK(expr) do { XrResult _r = (expr); if(XR_FAILED(_r)) { LOGE("%s failed: %d", #expr, (int)_r); goto fail; } } while(0)
@@ -222,16 +232,35 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 			bool menu = get_bool(r, A_MENU);
 			bool cross = get_bool(r, A_CROSS);
 			bool moon = get_bool(r, A_MOON);
-			// Menu alone is Options; Menu + A is PS, Menu + B is Share.
-			if(menu && cross)
-				buttons |= BTN_PS;
-			else if(menu && moon)
-				buttons |= BTN_SHARE;
+			XrVector2f ls = get_vec2(r, A_LSTICK);
+			XrVector2f rs = get_vec2(r, A_RSTICK);
+
+			// Menu is a modifier: Menu + A = PS, Menu + B = Share, Menu + left stick = D-pad.
+			// Options is only sent as a tap when Menu is released without any combo.
+			if(menu)
+			{
+				if(!r->menu_held)
+					r->menu_combo = false;
+				if(cross) { buttons |= BTN_PS; r->menu_combo = true; }
+				if(moon) { buttons |= BTN_SHARE; r->menu_combo = true; }
+				if(ls.y > DPAD_THRESHOLD) { buttons |= BTN_DPAD_UP; r->menu_combo = true; }
+				if(ls.y < -DPAD_THRESHOLD) { buttons |= BTN_DPAD_DOWN; r->menu_combo = true; }
+				if(ls.x < -DPAD_THRESHOLD) { buttons |= BTN_DPAD_LEFT; r->menu_combo = true; }
+				if(ls.x > DPAD_THRESHOLD) { buttons |= BTN_DPAD_RIGHT; r->menu_combo = true; }
+				ls.x = ls.y = 0.0f; // the stick is the D-pad while Menu is held
+			}
 			else
 			{
-				if(menu) buttons |= BTN_OPTIONS;
+				if(r->menu_held && !r->menu_combo)
+					r->options_frames = OPTIONS_TAP_FRAMES;
 				if(cross) buttons |= BTN_CROSS;
 				if(moon) buttons |= BTN_MOON;
+			}
+			r->menu_held = menu;
+			if(r->options_frames > 0)
+			{
+				buttons |= BTN_OPTIONS;
+				r->options_frames--;
 			}
 			if(get_bool(r, A_PYRAMID)) buttons |= BTN_PYRAMID;
 			if(get_bool(r, A_BOX)) buttons |= BTN_BOX;
@@ -241,8 +270,6 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 			if(get_float(r, A_R1) > 0.5f) buttons |= BTN_R1;
 			l2 = (jint)(get_float(r, A_L2) * 255.0f);
 			r2 = (jint)(get_float(r, A_R2) * 255.0f);
-			XrVector2f ls = get_vec2(r, A_LSTICK);
-			XrVector2f rs = get_vec2(r, A_RSTICK);
 			// OpenXR y is up, DualSense y is down
 			lx = stick_axis(ls.x); ly = stick_axis(-ls.y);
 			rx = stick_axis(rs.x); ry = stick_axis(-rs.y);
