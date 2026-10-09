@@ -98,6 +98,13 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
 		}
 	}
 
+	/** Surface owned by someone else, e.g. the OpenXR swapchain in immersive mode */
+	fun setExternalSurface(surface: Surface?)
+	{
+		this.surface = surface
+		session?.setSurface(surface)
+	}
+
 	fun attachToSurfaceView(surfaceView: SurfaceView)
 	{
 		surfaceView.holder.addCallback(object: SurfaceHolder.Callback {

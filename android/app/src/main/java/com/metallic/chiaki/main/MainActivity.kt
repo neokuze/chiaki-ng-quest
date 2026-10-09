@@ -181,8 +181,10 @@ class MainActivity : AppCompatActivity()
 		{
 			fun connect() {
 				val connectInfo = ConnectInfo(host.isPS5, host.host, registeredHost.rpRegistKey, registeredHost.rpKey, Preferences(this).videoProfile)
-				Intent(this, StreamActivity::class.java).let {
+				Intent(this, com.metallic.chiaki.stream.XrStreamActivity::class.java).let {
 					it.putExtra(StreamActivity.EXTRA_CONNECT_INFO, connectInfo)
+					// The immersive activity lives in its own task (Quest hybrid app)
+					it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 					startActivity(it)
 				}
 			}
