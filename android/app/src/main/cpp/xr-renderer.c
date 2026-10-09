@@ -220,21 +220,21 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 		if(xrSyncActions(r->session, &sync) == XR_SUCCESS)
 		{
 			bool menu = get_bool(r, A_MENU);
-			bool pyramid = get_bool(r, A_PYRAMID);
-			bool box = get_bool(r, A_BOX);
-			// Menu alone is Options; Menu + Y is PS, Menu + X is Share.
-			if(menu && pyramid)
+			bool cross = get_bool(r, A_CROSS);
+			bool moon = get_bool(r, A_MOON);
+			// Menu alone is Options; Menu + A is PS, Menu + B is Share.
+			if(menu && cross)
 				buttons |= BTN_PS;
-			else if(menu && box)
+			else if(menu && moon)
 				buttons |= BTN_SHARE;
 			else
 			{
 				if(menu) buttons |= BTN_OPTIONS;
-				if(pyramid) buttons |= BTN_PYRAMID;
-				if(box) buttons |= BTN_BOX;
+				if(cross) buttons |= BTN_CROSS;
+				if(moon) buttons |= BTN_MOON;
 			}
-			if(get_bool(r, A_CROSS)) buttons |= BTN_CROSS;
-			if(get_bool(r, A_MOON)) buttons |= BTN_MOON;
+			if(get_bool(r, A_PYRAMID)) buttons |= BTN_PYRAMID;
+			if(get_bool(r, A_BOX)) buttons |= BTN_BOX;
 			if(get_bool(r, A_L3)) buttons |= BTN_L3;
 			if(get_bool(r, A_R3)) buttons |= BTN_R3;
 			if(get_float(r, A_L1) > 0.5f) buttons |= BTN_L1;
