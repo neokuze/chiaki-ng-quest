@@ -14,8 +14,18 @@ class StreamInput(val context: Context, val preferences: Preferences)
 {
 	var controllerStateChangedCallback: ((ControllerState) -> Unit)? = null
 
+	/** Immersive mode secret menu: while set, the console only sees a neutral pad */
+	var blocked = false
+		set(value)
+		{
+			field = value
+			controllerStateUpdated()
+		}
+
 	val controllerState: ControllerState get()
 	{
+		if(blocked)
+			return ControllerState()
 		val controllerState = sensorControllerState or keyControllerState or motionControllerState
 
 		val windowManager = context.getSystemService(Context.WINDOW_SERVICE) as WindowManager

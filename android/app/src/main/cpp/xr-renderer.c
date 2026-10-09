@@ -10,6 +10,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
 #include <android/log.h>
 
@@ -41,12 +42,22 @@
 #define BTN_OPTIONS  (1 << 12)
 #define BTN_SHARE    (1 << 13)
 #define BTN_PS       (1 << 15)
+#define BTN_MENU_OPEN (1 << 30) // not a DualSense button, stripped in XrRenderer.kt
 
 #define DPAD_THRESHOLD 0.5f
 #define OPTIONS_TAP_FRAMES 8 // ~90 ms at 90 Hz, long enough for the console to see the press
 
 #define SCREEN_WIDTH_M 3.2f
 #define SCREEN_DISTANCE_M 2.4f
+
+// Secret menu: Menu + L1 + L2 + R1 + R2. Images come from Kotlin (XrRenderer.menuImage)
+#define MENU_IMG_SIZE 512
+#define MENU_IMG_COUNT 7 // 0 idle, 1 left, 2 up, 3 right, 4 down, 5 resize hint, 6 move hint
+#define MENU_SIZE_M 0.6f
+#define MENU_DISTANCE_M 1.0f
+#define MENU_DIR_THRESHOLD 0.6f
+
+enum { MODE_NONE, MODE_MENU, MODE_RESIZE, MODE_MOVE };
 
 enum {
 	A_CROSS, A_MOON, A_BOX, A_PYRAMID, A_L3, A_R3, A_MENU,
@@ -58,7 +69,7 @@ typedef struct XrRenderer
 	JavaVM *vm;
 	jobject activity; // global ref
 	jobject callback; // global ref, the Kotlin XrRenderer
-	jmethodID on_surface, on_input, on_exit;
+	jmethodID on_surface, on_input, on_exit, menu_image;
 	int width, height;
 
 	pthread_t thread;
@@ -82,6 +93,25 @@ typedef struct XrRenderer
 	bool menu_held;
 	bool menu_combo;
 	int options_frames;
+
+	// Screen placement, editable from the secret menu
+	XrPosef screen_pose;
+	float screen_width;
+	float screen_distance;
+	bool flip_ext; // XR_FB_composition_layer_image_layout available
+
+	// Secret menu
+	XrSpace view_space;
+	XrSwapchain menu_swapchain;
+	GLuint menu_textures[MENU_IMG_COUNT];
+	GLuint menu_fbo[2];
+	int menu_shown_img; // image currently in the swapchain, -1 = none yet
+	int mode;
+	int menu_dir; // 0 none, 1..4 like the image indices
+	XrPosef menu_pose;
+	bool prev_confirm, prev_combo;
+	bool release_guard; // menu just closed: keep the pad neutral until everything is let go
+	bool user_exit;
 } XrRenderer;
 
 #define XR_CHECK(expr) do { XrResult _r = (expr); if(XR_FAILED(_r)) { LOGE("%s failed: %d", #expr, (int)_r); goto fail; } } while(0)
@@ -215,6 +245,250 @@ static jshort stick_axis(float v)
 	return (jshort)(v * 32767.0f);
 }
 
+static XrQuaternionf quat_mul(XrQuaternionf a, XrQuaternionf b)
+{
+	XrQuaternionf q = {
+		a.w * b.x + a.x * b.w + a.y * b.z - a.z * b.y,
+		a.w * b.y - a.x * b.z + a.y * b.w + a.z * b.x,
+		a.w * b.z + a.x * b.y - a.y * b.x + a.z * b.w,
+		a.w * b.w - a.x * b.x - a.y * b.y - a.z * b.z
+	};
+	return q;
+}
+
+static XrTime frame_time; // predicted display time of the frame being built
+
+// Pose `distance` metres in front of the head, kept upright (yaw only)
+static bool pose_in_front_of_head(XrRenderer *r, float distance, bool follow_pitch, XrPosef *out)
+{
+	if(r->view_space == XR_NULL_HANDLE || !frame_time)
+		return false;
+	XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION };
+	if(XR_FAILED(xrLocateSpace(r->view_space, r->space, frame_time, &loc))
+			|| !(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)
+			|| !(loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT))
+		return false;
+	XrQuaternionf q = loc.pose.orientation;
+	// forward = q * (0,0,-1), flattened onto the floor plane
+	float fx = -2.0f * (q.x * q.z + q.w * q.y);
+	float fz = -(1.0f - 2.0f * (q.x * q.x + q.y * q.y));
+	float len = sqrtf(fx * fx + fz * fz);
+	if(len < 1e-4f)
+		return false;
+	fx /= len; fz /= len;
+	float yaw = atan2f(-fx, -fz);
+	float pitch = 0.0f;
+	if(follow_pitch)
+	{
+		float fy = 2.0f * (q.w * q.x - q.y * q.z);
+		if(fy > 1.0f) fy = 1.0f;
+		if(fy < -1.0f) fy = -1.0f;
+		pitch = asinf(fy);
+		// small nods keep the screen upright, only a clear look up/down tilts it
+		const float dead = 8.0f * 3.14159265f / 180.0f;
+		if(fabsf(pitch) < dead)
+			pitch = 0.0f;
+	}
+	XrQuaternionf qyaw = { 0.0f, sinf(yaw * 0.5f), 0.0f, cosf(yaw * 0.5f) };
+	XrQuaternionf qpitch = { sinf(pitch * 0.5f), 0.0f, 0.0f, cosf(pitch * 0.5f) };
+	// the quad faces +Z, so tilting it by the head pitch keeps it facing the viewer
+	out->orientation = quat_mul(qyaw, qpitch);
+	float cp = cosf(pitch);
+	out->position.x = loc.pose.position.x + fx * cp * distance;
+	out->position.y = loc.pose.position.y + sinf(pitch) * distance;
+	out->position.z = loc.pose.position.z + fz * cp * distance;
+	return true;
+}
+
+static int stick_dir(XrVector2f v)
+{
+	if(fabsf(v.x) < MENU_DIR_THRESHOLD && fabsf(v.y) < MENU_DIR_THRESHOLD)
+		return 0;
+	if(fabsf(v.x) > fabsf(v.y))
+		return v.x < 0 ? 1 : 3;
+	return v.y > 0 ? 2 : 4;
+}
+
+static float stronger_y(XrVector2f a, XrVector2f b)
+{
+	return fabsf(a.y) > fabsf(b.y) ? a.y : b.y;
+}
+
+// Returns true while the secret menu (or one of its modes) owns the controllers
+static bool handle_menu(XrRenderer *r)
+{
+	bool combo = get_bool(r, A_MENU) && get_float(r, A_L1) > 0.5f && get_float(r, A_R1) > 0.5f
+		&& get_float(r, A_L2) > 0.5f && get_float(r, A_R2) > 0.5f;
+	bool confirm = get_bool(r, A_CROSS);
+	bool confirm_edge = confirm && !r->prev_confirm;
+	bool combo_edge = combo && !r->prev_combo;
+	r->prev_confirm = confirm;
+	r->prev_combo = combo;
+
+	if(r->mode == MODE_NONE && r->release_guard)
+	{
+		XrVector2f gl = get_vec2(r, A_LSTICK), gr = get_vec2(r, A_RSTICK);
+		bool any = get_bool(r, A_MENU) || confirm || get_bool(r, A_MOON) || get_bool(r, A_BOX)
+			|| get_bool(r, A_PYRAMID) || get_bool(r, A_L3) || get_bool(r, A_R3)
+			|| get_float(r, A_L1) > 0.2f || get_float(r, A_R1) > 0.2f
+			|| get_float(r, A_L2) > 0.2f || get_float(r, A_R2) > 0.2f
+			|| fabsf(gl.x) > 0.3f || fabsf(gl.y) > 0.3f || fabsf(gr.x) > 0.3f || fabsf(gr.y) > 0.3f;
+		if(any)
+			return true;
+		r->release_guard = false;
+		r->menu_held = false;
+		return false;
+	}
+
+	if(r->mode == MODE_NONE)
+	{
+		if(!combo_edge || r->menu_swapchain == XR_NULL_HANDLE)
+			return false;
+		if(!pose_in_front_of_head(r, MENU_DISTANCE_M, false, &r->menu_pose))
+		{
+			r->menu_pose.orientation = (XrQuaternionf){ 0, 0, 0, 1 };
+			r->menu_pose.position = (XrVector3f){ 0, 0, -MENU_DISTANCE_M };
+		}
+		r->mode = MODE_MENU;
+		r->menu_dir = 0;
+		r->menu_combo = true; // releasing Menu must not send Options
+		LOGI("Secret menu opened");
+		return true;
+	}
+
+	XrVector2f ls = get_vec2(r, A_LSTICK);
+	XrVector2f rs = get_vec2(r, A_RSTICK);
+	switch(r->mode)
+	{
+		case MODE_MENU:
+		{
+			int d = stick_dir(rs);
+			if(!d)
+				d = stick_dir(ls);
+			if(d)
+				r->menu_dir = d;
+			if(confirm_edge && r->menu_dir)
+			{
+				switch(r->menu_dir)
+				{
+					case 1: r->mode = MODE_RESIZE; break;
+					case 2: r->mode = MODE_NONE; break;
+					case 3: r->mode = MODE_MOVE; break;
+					case 4: r->mode = MODE_NONE; r->user_exit = true; r->quit = true; break;
+				}
+				r->menu_dir = 0;
+			}
+			break;
+		}
+		case MODE_RESIZE:
+		{
+			float y = stronger_y(rs, ls);
+			if(fabsf(y) > 0.15f)
+				r->screen_width *= 1.0f + y * 0.015f;
+			if(r->screen_width < 0.8f) r->screen_width = 0.8f;
+			if(r->screen_width > 12.0f) r->screen_width = 12.0f;
+			if(confirm_edge)
+				r->mode = MODE_NONE;
+			break;
+		}
+		case MODE_MOVE:
+		{
+			float y = stronger_y(rs, ls);
+			if(fabsf(y) > 0.15f)
+				r->screen_distance *= 1.0f - y * 0.015f;
+			if(r->screen_distance < 0.8f) r->screen_distance = 0.8f;
+			if(r->screen_distance > 10.0f) r->screen_distance = 10.0f;
+			pose_in_front_of_head(r, r->screen_distance, true, &r->screen_pose);
+			if(confirm_edge)
+				r->mode = MODE_NONE;
+			break;
+		}
+	}
+	if(r->mode == MODE_NONE)
+		r->release_guard = true;
+	return true;
+}
+
+// Loads the menu images from Kotlin into GL textures and creates the menu swapchain
+static bool menu_init(XrRenderer *r, JNIEnv *env)
+{
+	XrReferenceSpaceCreateInfo view_info = { XR_TYPE_REFERENCE_SPACE_CREATE_INFO };
+	view_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+	view_info.poseInReferenceSpace.orientation.w = 1.0f;
+	XrResult res = xrCreateReferenceSpace(r->session, &view_info, &r->view_space);
+	if(XR_FAILED(res)) { LOGE("menu: view space %d", res); return false; }
+
+	// Quest supports these; try them in order instead of trusting the format enumeration
+	static const int64_t formats[] = { GL_SRGB8_ALPHA8, GL_RGBA8 };
+	XrSwapchainCreateInfo info = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+	info.width = info.height = MENU_IMG_SIZE;
+	info.sampleCount = info.faceCount = info.arraySize = info.mipCount = 1;
+	res = XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+	for(int i = 0; i < 2 && XR_FAILED(res); i++)
+	{
+		info.format = formats[i];
+		info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+		res = xrCreateSwapchain(r->session, &info, &r->menu_swapchain);
+		if(XR_FAILED(res))
+		{
+			info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT;
+			res = xrCreateSwapchain(r->session, &info, &r->menu_swapchain);
+		}
+		LOGI("menu: swapchain format 0x%x: %d", (int)info.format, res);
+	}
+	if(XR_FAILED(res))
+		return false;
+
+	glGenTextures(MENU_IMG_COUNT, r->menu_textures);
+	glGenFramebuffers(2, r->menu_fbo);
+	for(int i = 0; i < MENU_IMG_COUNT; i++)
+	{
+		jbyteArray pixels = (*env)->CallObjectMethod(env, r->callback, r->menu_image, i, MENU_IMG_SIZE);
+		if((*env)->ExceptionCheck(env)) { (*env)->ExceptionDescribe(env); (*env)->ExceptionClear(env); }
+		if(!pixels) { LOGE("menu: image %d missing", i); return false; }
+		jbyte *data = (*env)->GetByteArrayElements(env, pixels, NULL);
+		glBindTexture(GL_TEXTURE_2D, r->menu_textures[i]);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, MENU_IMG_SIZE, MENU_IMG_SIZE, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+		(*env)->ReleaseByteArrayElements(env, pixels, data, JNI_ABORT);
+		(*env)->DeleteLocalRef(env, pixels);
+	}
+	r->menu_shown_img = -1;
+	return true;
+}
+
+static void menu_draw(XrRenderer *r, int img)
+{
+	if(img == r->menu_shown_img)
+		return; // the last released image is still valid
+	uint32_t index = 0;
+	XrSwapchainImageAcquireInfo acq = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+	if(XR_FAILED(xrAcquireSwapchainImage(r->menu_swapchain, &acq, &index)))
+		return;
+	XrSwapchainImageWaitInfo wait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+	wait.timeout = XR_INFINITE_DURATION;
+	xrWaitSwapchainImage(r->menu_swapchain, &wait);
+
+	XrSwapchainImageOpenGLESKHR images[8];
+	uint32_t n = 0;
+	for(int i = 0; i < 8; i++)
+		images[i] = (XrSwapchainImageOpenGLESKHR){ XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR };
+	xrEnumerateSwapchainImages(r->menu_swapchain, 8, &n, (XrSwapchainImageBaseHeader *)images);
+	if(index < n)
+	{
+		glBindFramebuffer(GL_READ_FRAMEBUFFER, r->menu_fbo[0]);
+		glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r->menu_textures[img], 0);
+		glBindFramebuffer(GL_DRAW_FRAMEBUFFER, r->menu_fbo[1]);
+		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, images[index].image, 0);
+		// Bitmaps are top row first, GL images bottom row first
+		glBlitFramebuffer(0, 0, MENU_IMG_SIZE, MENU_IMG_SIZE, 0, MENU_IMG_SIZE, MENU_IMG_SIZE, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		glFinish();
+	}
+	XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+	xrReleaseSwapchainImage(r->menu_swapchain, &rel);
+	r->menu_shown_img = img;
+}
+
 static void poll_input(XrRenderer *r, JNIEnv *env)
 {
 	jint buttons = 0;
@@ -227,9 +501,17 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 		XrActionsSyncInfo sync = { XR_TYPE_ACTIONS_SYNC_INFO };
 		sync.countActiveActionSets = 1;
 		sync.activeActionSets = &active;
-		if(xrSyncActions(r->session, &sync) == XR_SUCCESS)
+		if(xrSyncActions(r->session, &sync) == XR_SUCCESS && !handle_menu(r))
 		{
 			bool menu = get_bool(r, A_MENU);
+			static int dbg;
+			if(++dbg % 90 == 0)
+			{
+				XrVector2f l = get_vec2(r, A_LSTICK), rr = get_vec2(r, A_RSTICK);
+				LOGI("in: menu=%d A=%d X=%d L1=%.2f R1=%.2f L2=%.2f R2=%.2f ls=%.2f,%.2f rs=%.2f,%.2f",
+					menu, get_bool(r, A_CROSS), get_bool(r, A_BOX), get_float(r, A_L1), get_float(r, A_R1),
+					get_float(r, A_L2), get_float(r, A_R2), l.x, l.y, rr.x, rr.y);
+			}
 			bool cross = get_bool(r, A_CROSS);
 			bool moon = get_bool(r, A_MOON);
 			XrVector2f ls = get_vec2(r, A_LSTICK);
@@ -266,16 +548,26 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 			if(get_bool(r, A_BOX)) buttons |= BTN_BOX;
 			if(get_bool(r, A_L3)) buttons |= BTN_L3;
 			if(get_bool(r, A_R3)) buttons |= BTN_R3;
-			if(get_float(r, A_L1) > 0.5f) buttons |= BTN_L1;
-			if(get_float(r, A_R1) > 0.5f) buttons |= BTN_R1;
-			l2 = (jint)(get_float(r, A_L2) * 255.0f);
-			r2 = (jint)(get_float(r, A_R2) * 255.0f);
+			// While Menu is held the shoulders and triggers belong to the secret menu combo,
+			// so the console never sees them
+			if(!menu)
+			{
+				if(get_float(r, A_L1) > 0.5f) buttons |= BTN_L1;
+				if(get_float(r, A_R1) > 0.5f) buttons |= BTN_R1;
+				l2 = (jint)(get_float(r, A_L2) * 255.0f);
+				r2 = (jint)(get_float(r, A_R2) * 255.0f);
+			}
+			else if(get_float(r, A_L1) > 0.5f || get_float(r, A_R1) > 0.5f
+					|| get_float(r, A_L2) > 0.5f || get_float(r, A_R2) > 0.5f)
+				r->menu_combo = true; // no Options tap on release either
 			// OpenXR y is up, DualSense y is down
 			lx = stick_axis(ls.x); ly = stick_axis(-ls.y);
 			rx = stick_axis(rs.x); ry = stick_axis(-rs.y);
 		}
 	}
 
+	if(r->mode != MODE_NONE || r->release_guard)
+		buttons = BTN_MENU_OPEN; // neutral pad, and tells Kotlin to ignore Android gamepad events
 	(*env)->CallVoidMethod(env, r->callback, r->on_input, buttons, l2, r2, lx, ly, rx, ry);
 }
 
@@ -326,10 +618,24 @@ static void *xr_thread(void *user)
 	loader_info.applicationContext = r->activity;
 	XR_CHECK(init_loader((XrLoaderInitInfoBaseHeaderKHR *)&loader_info));
 
+	// The decoder writes the surface top row first, which the compositor shows upside down;
+	// XR_FB_composition_layer_image_layout flips it, otherwise the quad is turned around instead
+	uint32_t ext_count = 0;
+	xrEnumerateInstanceExtensionProperties(NULL, 0, &ext_count, NULL);
+	XrExtensionProperties *ext_props = calloc(ext_count ? ext_count : 1, sizeof(XrExtensionProperties));
+	for(uint32_t i = 0; i < ext_count; i++)
+		ext_props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
+	xrEnumerateInstanceExtensionProperties(NULL, ext_count, &ext_count, ext_props);
+	for(uint32_t i = 0; i < ext_count; i++)
+		if(!strcmp(ext_props[i].extensionName, XR_FB_COMPOSITION_LAYER_IMAGE_LAYOUT_EXTENSION_NAME))
+			r->flip_ext = true;
+	free(ext_props);
+	LOGI("Image layout flip extension: %d", r->flip_ext);
 	const char *exts[] = {
 		XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 		XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
 		XR_KHR_ANDROID_SURFACE_SWAPCHAIN_EXTENSION_NAME,
+		XR_FB_COMPOSITION_LAYER_IMAGE_LAYOUT_EXTENSION_NAME,
 	};
 	XrInstanceCreateInfoAndroidKHR android_info = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
 	android_info.applicationVM = r->vm;
@@ -338,7 +644,7 @@ static void *xr_thread(void *user)
 	inst_info.next = &android_info;
 	strcpy(inst_info.applicationInfo.applicationName, "Chiaki Immersive");
 	inst_info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-	inst_info.enabledExtensionCount = sizeof(exts) / sizeof(exts[0]);
+	inst_info.enabledExtensionCount = sizeof(exts) / sizeof(exts[0]) - (r->flip_ext ? 0 : 1);
 	inst_info.enabledExtensionNames = exts;
 	XR_CHECK(xrCreateInstance(&inst_info, &r->instance));
 
@@ -367,6 +673,8 @@ static void *xr_thread(void *user)
 
 	if(!input_init(r))
 		LOGE("Controller input setup failed, only physical gamepads will work");
+	if(!menu_init(r, env))
+		LOGE("Secret menu setup failed");
 
 	PFN_xrCreateSwapchainAndroidSurfaceKHR create_surface_swapchain = NULL;
 	XR_CHECK(xrGetInstanceProcAddr(r->instance, "xrCreateSwapchainAndroidSurfaceKHR", (PFN_xrVoidFunction *)&create_surface_swapchain));
@@ -379,9 +687,27 @@ static void *xr_thread(void *user)
 	sc_info.arraySize = 1;
 	sc_info.mipCount = 1;
 	jobject surface = NULL;
-	XR_CHECK(create_surface_swapchain(r->session, &sc_info, &r->swapchain, &surface));
+	// Runtimes disagree on what a surface swapchain may carry; try the known variants in turn
+	XrResult sc_res = create_surface_swapchain(r->session, &sc_info, &r->swapchain, &surface);
+	LOGI("surface swapchain (sampled|color, counts 1): %d", sc_res);
+	if(XR_FAILED(sc_res))
+	{
+		sc_info.usageFlags = 0;
+		sc_info.sampleCount = sc_info.faceCount = sc_info.arraySize = sc_info.mipCount = 0;
+		sc_res = create_surface_swapchain(r->session, &sc_info, &r->swapchain, &surface);
+		LOGI("surface swapchain (no usage, counts 0): %d", sc_res);
+	}
+	if(XR_FAILED(sc_res))
+	{
+		sc_info.usageFlags = XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+		sc_info.format = 0x8058; // GL_RGBA8
+		sc_info.sampleCount = sc_info.faceCount = sc_info.arraySize = sc_info.mipCount = 1;
+		sc_res = create_surface_swapchain(r->session, &sc_info, &r->swapchain, &surface);
+		LOGI("surface swapchain (RGBA8, sampled): %d", sc_res);
+	}
+	XR_CHECK(sc_res);
 	(*env)->CallVoidMethod(env, r->callback, r->on_surface, surface);
-	(*env)->DeleteLocalRef(env, surface);
+	// The runtime owns this reference (Meta hands out a global ref); don't delete it
 	LOGI("Surface swapchain %dx%d handed to the decoder", r->width, r->height);
 
 	while(!r->quit)
@@ -418,24 +744,51 @@ static void *xr_thread(void *user)
 		XrFrameBeginInfo begin_info = { XR_TYPE_FRAME_BEGIN_INFO };
 		xrBeginFrame(r->session, &begin_info);
 
+		frame_time = frame_state.predictedDisplayTime;
 		poll_input(r, env);
 
+		XrCompositionLayerImageLayoutFB layout = { XR_TYPE_COMPOSITION_LAYER_IMAGE_LAYOUT_FB };
+		layout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
 		XrCompositionLayerQuad quad = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 		quad.space = r->space;
 		quad.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
 		quad.subImage.swapchain = r->swapchain;
 		quad.subImage.imageRect.extent.width = r->width;
 		quad.subImage.imageRect.extent.height = r->height;
-		quad.pose.orientation.w = 1.0f;
-		quad.pose.position.z = -SCREEN_DISTANCE_M;
-		quad.size.width = SCREEN_WIDTH_M;
-		quad.size.height = SCREEN_WIDTH_M * (float)r->height / (float)r->width;
-		const XrCompositionLayerBaseHeader *layers[] = { (XrCompositionLayerBaseHeader *)&quad };
+		quad.pose = r->screen_pose;
+		if(r->flip_ext)
+			quad.next = &layout;
+		else
+		{
+			// Seen from behind after half a turn around X: a pure vertical flip
+			XrQuaternionf flip = { 1.0f, 0.0f, 0.0f, 0.0f };
+			quad.pose.orientation = quat_mul(quad.pose.orientation, flip);
+		}
+		quad.size.width = r->screen_width;
+		quad.size.height = r->screen_width * (float)r->height / (float)r->width;
+		const XrCompositionLayerBaseHeader *layers[2] = { (XrCompositionLayerBaseHeader *)&quad };
+		uint32_t layer_count = 1;
+
+		XrCompositionLayerQuad menu = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+		if(r->mode != MODE_NONE && frame_state.shouldRender)
+		{
+			int img = r->mode == MODE_RESIZE ? 5 : r->mode == MODE_MOVE ? 6 : r->menu_dir;
+			menu_draw(r, img);
+			menu.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+			menu.space = r->space;
+			menu.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+			menu.subImage.swapchain = r->menu_swapchain;
+			menu.subImage.imageRect.extent.width = MENU_IMG_SIZE;
+			menu.subImage.imageRect.extent.height = MENU_IMG_SIZE;
+			menu.pose = r->menu_pose;
+			menu.size.width = menu.size.height = MENU_SIZE_M;
+			layers[layer_count++] = (XrCompositionLayerBaseHeader *)&menu;
+		}
 
 		XrFrameEndInfo end_info = { XR_TYPE_FRAME_END_INFO };
 		end_info.displayTime = frame_state.predictedDisplayTime;
 		end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-		end_info.layerCount = frame_state.shouldRender ? 1 : 0;
+		end_info.layerCount = frame_state.shouldRender ? layer_count : 0;
 		end_info.layers = layers;
 		xrEndFrame(r->session, &end_info);
 	}
@@ -443,13 +796,15 @@ static void *xr_thread(void *user)
 fail:
 	(*env)->CallVoidMethod(env, r->callback, r->on_surface, NULL);
 	if(r->swapchain != XR_NULL_HANDLE) xrDestroySwapchain(r->swapchain);
+	if(r->menu_swapchain != XR_NULL_HANDLE) xrDestroySwapchain(r->menu_swapchain);
+	if(r->view_space != XR_NULL_HANDLE) xrDestroySpace(r->view_space);
 	if(r->action_set != XR_NULL_HANDLE) xrDestroyActionSet(r->action_set);
 	if(r->space != XR_NULL_HANDLE) xrDestroySpace(r->space);
 	if(r->session != XR_NULL_HANDLE) xrDestroySession(r->session);
 	if(r->instance != XR_NULL_HANDLE) xrDestroyInstance(r->instance);
 	egl_fini(r);
 	// Tell the activity to finish unless it asked us to stop in the first place
-	if(exit_requested_by_runtime || !r->quit)
+	if(exit_requested_by_runtime || !r->quit || r->user_exit)
 		(*env)->CallVoidMethod(env, r->callback, r->on_exit);
 	(*r->vm)->DetachCurrentThread(r->vm);
 	return NULL;
@@ -467,8 +822,13 @@ JNIEXPORT jlong JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeStart(J
 	r->on_surface = (*env)->GetMethodID(env, cls, "onSurface", "(Landroid/view/Surface;)V");
 	r->on_input = (*env)->GetMethodID(env, cls, "onInput", "(IIISSSS)V");
 	r->on_exit = (*env)->GetMethodID(env, cls, "onExit", "()V");
+	r->menu_image = (*env)->GetMethodID(env, cls, "menuImage", "(II)[B");
 	r->width = width;
 	r->height = height;
+	r->screen_pose.orientation.w = 1.0f;
+	r->screen_pose.position.z = -SCREEN_DISTANCE_M;
+	r->screen_width = SCREEN_WIDTH_M;
+	r->screen_distance = SCREEN_DISTANCE_M;
 	r->egl_display = EGL_NO_DISPLAY;
 	r->egl_context = EGL_NO_CONTEXT;
 	r->egl_surface = EGL_NO_SURFACE;

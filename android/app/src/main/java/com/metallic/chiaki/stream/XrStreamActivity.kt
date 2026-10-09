@@ -70,6 +70,7 @@ class XrStreamActivity : ComponentActivity()
 		renderer = XrRenderer(this,
 			surfaceCallback = { viewModel.session.setExternalSurface(it) },
 			inputCallback = { viewModel.input.touchControllerState = it },
+			menuCallback = { viewModel.input.blocked = it },
 			exitCallback = { finish() }
 		).also { it.start(profile.width, profile.height) }
 	}
@@ -95,6 +96,8 @@ class XrStreamActivity : ComponentActivity()
 			viewModel.session.shutdown()
 	}
 
+	// Events always reach StreamInput so its key state stays consistent; while the secret
+	// menu is open StreamInput.blocked keeps all of it away from the console
 	override fun dispatchKeyEvent(event: KeyEvent) =
 		(::viewModel.isInitialized && viewModel.input.dispatchKeyEvent(event)) || super.dispatchKeyEvent(event)
 
