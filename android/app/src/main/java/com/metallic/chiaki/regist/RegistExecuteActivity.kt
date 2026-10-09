@@ -82,6 +82,12 @@ class RegistExecuteActivity: AppCompatActivity()
 			}
 		})
 
+		binding.backHomeButton.setOnClickListener {
+			startActivity(android.content.Intent(this, com.metallic.chiaki.main.MainActivity::class.java)
+				.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP))
+			finish()
+		}
+
 		binding.shareLogButton.setOnClickListener {
 			val log = viewModel.logText.value ?: ""
 			Intent(Intent.ACTION_SEND).also {

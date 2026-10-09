@@ -49,7 +49,8 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
 
 	fun pause()
 	{
-		shutdown()
+		// Keep the session alive while paused (e.g. headset taken off on Quest).
+		// Video output detaches with the surface; shutdown happens when the ViewModel is cleared.
 	}
 
 	fun resume()

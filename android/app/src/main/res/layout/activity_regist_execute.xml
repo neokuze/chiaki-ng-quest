@@ -44,6 +44,16 @@
         app:icon="@drawable/ic_share"
         android:text="@string/action_share_log"/>
 
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/backHomeButton"
+        android:layout_width="wrap_content"
+        android:layout_height="48dp"
+        android:layout_marginEnd="8dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toStartOf="@id/shareLogButton"
+        style="@style/MageTheme.Button"
+        android:text="@string/action_back_home"/>
+
     <ProgressBar
         android:id="@+id/progressBar"
         android:visibility="gone"
@@ -58,7 +68,7 @@
         android:layout_height="48dp"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintBottom_toBottomOf="parent"
-        app:layout_constraintEnd_toStartOf="@id/shareLogButton"
+        app:layout_constraintEnd_toStartOf="@id/backHomeButton"
         android:gravity="center_vertical"
         android:paddingStart="8dp"
         android:layout_marginEnd="8dp"
