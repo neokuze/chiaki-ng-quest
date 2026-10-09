@@ -235,7 +235,7 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 			XrVector2f ls = get_vec2(r, A_LSTICK);
 			XrVector2f rs = get_vec2(r, A_RSTICK);
 
-			// Menu is a modifier: Menu + A = PS, Menu + B = Share, Menu + left stick = D-pad.
+			// Menu is a modifier: Menu + A = PS, Menu + B = Share, Menu + right stick = D-pad.
 			// Options is only sent as a tap when Menu is released without any combo.
 			if(menu)
 			{
@@ -243,11 +243,11 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 					r->menu_combo = false;
 				if(cross) { buttons |= BTN_PS; r->menu_combo = true; }
 				if(moon) { buttons |= BTN_SHARE; r->menu_combo = true; }
-				if(ls.y > DPAD_THRESHOLD) { buttons |= BTN_DPAD_UP; r->menu_combo = true; }
-				if(ls.y < -DPAD_THRESHOLD) { buttons |= BTN_DPAD_DOWN; r->menu_combo = true; }
-				if(ls.x < -DPAD_THRESHOLD) { buttons |= BTN_DPAD_LEFT; r->menu_combo = true; }
-				if(ls.x > DPAD_THRESHOLD) { buttons |= BTN_DPAD_RIGHT; r->menu_combo = true; }
-				ls.x = ls.y = 0.0f; // the stick is the D-pad while Menu is held
+				if(rs.y > DPAD_THRESHOLD) { buttons |= BTN_DPAD_UP; r->menu_combo = true; }
+				if(rs.y < -DPAD_THRESHOLD) { buttons |= BTN_DPAD_DOWN; r->menu_combo = true; }
+				if(rs.x < -DPAD_THRESHOLD) { buttons |= BTN_DPAD_LEFT; r->menu_combo = true; }
+				if(rs.x > DPAD_THRESHOLD) { buttons |= BTN_DPAD_RIGHT; r->menu_combo = true; }
+				rs.x = rs.y = 0.0f; // the stick is the D-pad while Menu is held
 			}
 			else
 			{
