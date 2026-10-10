@@ -99,6 +99,11 @@ class Preferences(context: Context)
 		get() = sharedPreferences.getBoolean(ultraLowLatencyKey, false)
 		set(value) { sharedPreferences.edit().putBoolean(ultraLowLatencyKey, value).apply() }
 
+	val badNetworkModeKey get() = resources.getString(R.string.preferences_bad_network_mode_key)
+	var badNetworkMode
+		get() = sharedPreferences.getBoolean(badNetworkModeKey, false)
+		set(value) { sharedPreferences.edit().putBoolean(badNetworkModeKey, value).apply() }
+
 	val swapCrossMoonKey get() = resources.getString(R.string.preferences_swap_cross_moon_key)
 	var swapCrossMoon
 		get() = sharedPreferences.getBoolean(swapCrossMoonKey, false)

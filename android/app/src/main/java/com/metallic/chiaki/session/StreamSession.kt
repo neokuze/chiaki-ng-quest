@@ -6,6 +6,10 @@ import android.content.Context
 import android.graphics.SurfaceTexture
 import android.net.wifi.WifiManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import com.metallic.chiaki.common.Preferences
 import android.util.Log
 import android.view.*
 import androidx.lifecycle.LiveData
@@ -21,10 +25,17 @@ data class StreamStateCreateError(val error: CreateError): StreamState()
 data class StreamStateQuit(val reason: QuitReason, val reasonString: String?): StreamState()
 data class StreamStateLoginPinRequest(val pinIncorrect: Boolean): StreamState()
 
-class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, val logVerbose: Boolean, val input: StreamInput)
+class StreamSession(connectInfo: ConnectInfo, val logManager: LogManager, val logVerbose: Boolean, val input: StreamInput)
 {
-	var session: Session? = null
+	var connectInfo = connectInfo
 		private set
+
+	@Volatile var session: Session? = null
+		private set
+
+	/** Short message to show over the stream, e.g. while Bad Network Mode switches resolution */
+	private val _notice = MutableLiveData<String?>(null)
+	val notice: LiveData<String?> get() = _notice
 
 	private val _state = MutableLiveData<StreamState>(StreamStateIdle)
 	val state: LiveData<StreamState> get() = _state
@@ -46,12 +57,105 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
 	init
 	{
 		input.controllerStateChangedCallback = {
+			if(it.buttons != 0U || it.l2State > 16U || it.r2State > 16U
+					|| it.leftX.absBig() || it.leftY.absBig() || it.rightX.absBig() || it.rightY.absBig())
+				lastPlayInput = SystemClock.elapsedRealtime()
 			session?.setControllerState(it)
 		}
 	}
 
+	private fun Short.absBig() = this > 6000 || this < -6000
+
+	// --- Bad Network Mode ---
+	// The console fixes the resolution when the session starts, so changing it means
+	// reconnecting. Going down only happens once the picture is already frozen, going
+	// back up only while nobody is playing, so the switch never costs a live moment.
+
+	private val badNetworkMode = input.preferences.badNetworkMode
+	private val handler = Handler(Looper.getMainLooper())
+	/** Resolutions to walk through, best first, starting with the one from the settings */
+	private val steps = Preferences.Resolution.values()
+		.filter { it.preset.value <= input.preferences.resolution.preset.value }
+		.sortedByDescending { it.preset.value }
+	private var step = 0
+	private var reconnecting = false
+	private var lastFrames = -1L
+	private var frozenMs = 0L
+	private var stableMs = 0L
+	@Volatile private var lastPlayInput = 0L
+	@Volatile private var retired: Session? = null
+
+	private val monitor = object: Runnable {
+		override fun run()
+		{
+			handler.postDelayed(this, MONITOR_INTERVAL_MS)
+			val session = session
+			if(session == null || paused || reconnecting || _state.value != StreamStateConnected)
+			{
+				lastFrames = -1L
+				frozenMs = 0L
+				return
+			}
+			val frames = session.framesDecoded()
+			if(lastFrames >= 0 && frames == lastFrames)
+			{
+				frozenMs += MONITOR_INTERVAL_MS
+				stableMs = 0L
+			}
+			else
+			{
+				frozenMs = 0L
+				stableMs += MONITOR_INTERVAL_MS
+			}
+			lastFrames = frames
+
+			if(frozenMs >= FREEZE_DOWNGRADE_MS && step < steps.size - 1)
+			{
+				Log.i("StreamSession", "Bad Network Mode: frozen for ${frozenMs}ms, going down to ${steps[step + 1].value}")
+				reconnect(step + 1)
+			}
+			else if(step > 0 && stableMs >= STABLE_UPGRADE_MS
+					&& SystemClock.elapsedRealtime() - lastPlayInput >= IDLE_UPGRADE_MS)
+			{
+				Log.i("StreamSession", "Bad Network Mode: stable for ${stableMs}ms and idle, going up to ${steps[step - 1].value}")
+				reconnect(step - 1)
+			}
+		}
+	}
+
+	private fun reconnect(newStep: Int)
+	{
+		reconnecting = true
+		step = newStep
+		frozenMs = 0L
+		stableMs = 0L
+		lastFrames = -1L
+		val res = steps[step]
+		val prefs = input.preferences
+		val preset = ConnectVideoProfile.preset(res.preset, prefs.fps.preset, prefs.codec.codec)
+		val userBitrate = prefs.bitrate
+		val profile = if(userBitrate != null && userBitrate < preset.bitrate) preset.copy(bitrate = userBitrate) else preset
+		connectInfo = connectInfo.copy(videoProfile = profile)
+		_notice.value = input.context.getString(com.metallic.chiaki.R.string.stream_adjusting_quality, res.value)
+
+		val old = session
+		retired = old
+		session = null
+		// Stopping joins the session threads, keep that off the main thread
+		Thread {
+			old?.stop()
+			old?.dispose()
+			handler.post {
+				if(reconnecting && session == null)
+					startSession(silent = true)
+			}
+		}.start()
+	}
+
 	fun shutdown()
 	{
+		handler.removeCallbacks(monitor)
+		reconnecting = false
 		wifiLock?.release()
 		session?.stop()
 		session?.dispose()
@@ -73,13 +177,24 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
 	{
 		paused = false
 		wifiLock?.acquire()
-		if(session != null)
+		if(session != null || reconnecting)
 			return
+		if(badNetworkMode)
+		{
+			handler.removeCallbacks(monitor)
+			handler.postDelayed(monitor, MONITOR_INTERVAL_MS)
+		}
+		startSession(silent = false)
+	}
+
+	private fun startSession(silent: Boolean)
+	{
 		try
 		{
 			val session = Session(connectInfo, logManager.createNewFile().file.absolutePath, logVerbose)
-			_state.value = StreamStateConnecting
-			session.eventCallback = this::eventCallback
+			if(!silent)
+				_state.value = StreamStateConnecting
+			session.eventCallback = { event -> eventCallback(session, event) }
 			session.start()
 			val surface = surface
 			if(surface != null)
@@ -88,15 +203,36 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
 		}
 		catch(e: CreateError)
 		{
+			reconnecting = false
+			_notice.value = null
 			_state.value = StreamStateCreateError(e)
 		}
 	}
 
-	private fun eventCallback(event: Event)
+	companion object
 	{
+		private const val MONITOR_INTERVAL_MS = 500L
+		private const val FREEZE_DOWNGRADE_MS = 3000L
+		private const val STABLE_UPGRADE_MS = 120_000L
+		private const val IDLE_UPGRADE_MS = 10_000L
+		private const val NOTICE_LINGER_MS = 1500L
+	}
+
+	private fun eventCallback(source: Session, event: Event)
+	{
+		// Late events (e.g. its quit) from a session replaced by Bad Network Mode
+		if(source === retired)
+			return
 		when(event)
 		{
-			is ConnectedEvent -> _state.postValue(StreamStateConnected)
+			is ConnectedEvent -> {
+				_state.postValue(StreamStateConnected)
+				if(reconnecting)
+					handler.post {
+						reconnecting = false
+						handler.postDelayed({ if(!reconnecting) _notice.value = null }, NOTICE_LINGER_MS)
+					}
+			}
 			is QuitEvent -> _state.postValue(
 				StreamStateQuit(
 					event.reason,

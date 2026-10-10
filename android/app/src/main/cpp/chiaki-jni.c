@@ -405,6 +405,12 @@ JNIEXPORT jint JNICALL JNI_FCN(sessionJoin)(JNIEnv *env, jobject obj, jlong ptr)
 	return chiaki_session_join(&session->session);
 }
 
+JNIEXPORT jlong JNICALL JNI_FCN(sessionFramesDecoded)(JNIEnv *env, jobject obj, jlong ptr)
+{
+	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
+	return (jlong)session->video_decoder.frames_out;
+}
+
 JNIEXPORT void JNICALL JNI_FCN(sessionSetSurface)(JNIEnv *env, jobject obj, jlong ptr, jobject surface)
 {
 	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
