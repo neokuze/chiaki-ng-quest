@@ -120,11 +120,70 @@ class StreamInput(val context: Context, val preferences: Preferences)
 		controllerStateChangedCallback?.let { it(controllerState) }
 	}
 
+	private fun setKeyButton(mask: UInt, pressed: Boolean)
+	{
+		keyControllerState.buttons = if(pressed) keyControllerState.buttons or mask else keyControllerState.buttons and mask.inv()
+		controllerStateUpdated()
+	}
+
+	// Options is a modifier: Options + R3 = touchpad click, Options alone is sent as a tap on release
+	private var optionsHeld = false
+	private var optionsCombo = false
+	private val handler = android.os.Handler(android.os.Looper.getMainLooper())
+
+	private fun handleTouchpadCombo(event: KeyEvent): Boolean
+	{
+		val down = event.action == KeyEvent.ACTION_DOWN
+		when(event.keyCode)
+		{
+			KeyEvent.KEYCODE_MEDIA_RECORD -> { // Share button on Xbox Series controllers
+				setKeyButton(ControllerState.BUTTON_TOUCHPAD, down)
+				return true
+			}
+			KeyEvent.KEYCODE_BUTTON_START -> {
+				if(event.repeatCount > 0)
+					return true
+				if(down)
+				{
+					optionsHeld = true
+					optionsCombo = false
+				}
+				else
+				{
+					optionsHeld = false
+					if(!optionsCombo)
+					{
+						setKeyButton(ControllerState.BUTTON_OPTIONS, true)
+						handler.postDelayed({ setKeyButton(ControllerState.BUTTON_OPTIONS, false) }, 100)
+					}
+				}
+				return true
+			}
+			KeyEvent.KEYCODE_BUTTON_THUMBR -> {
+				if(down && optionsHeld)
+				{
+					optionsCombo = true
+					setKeyButton(ControllerState.BUTTON_TOUCHPAD, true)
+					return true
+				}
+				if(!down && keyControllerState.buttons and ControllerState.BUTTON_TOUCHPAD != 0U)
+				{
+					setKeyButton(ControllerState.BUTTON_TOUCHPAD or ControllerState.BUTTON_R3, false)
+					return true
+				}
+			}
+		}
+		return false
+	}
+
 	fun dispatchKeyEvent(event: KeyEvent): Boolean
 	{
 		//Log.i("StreamSession", "key event $event")
 		if(event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP)
 			return false
+
+		if(handleTouchpadCombo(event))
+			return true
 
 		when(event.keyCode)
 		{

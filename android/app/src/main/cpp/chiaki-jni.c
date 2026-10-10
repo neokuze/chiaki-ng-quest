@@ -230,6 +230,7 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 
 	ChiakiConnectInfo connect_info = { 0 };
 	connect_info.ps5 = ps5;
+	connect_info.decode_through_loss = E->GetBooleanField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "ultraLowLatency", "Z"));
 
 	const char *str_borrow = E->GetStringUTFChars(env, host_string, NULL);
 	connect_info.host = host_str = strdup(str_borrow);

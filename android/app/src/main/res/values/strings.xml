@@ -117,6 +117,9 @@
     <string name="preferences_import_settings_key">import_settings</string>
     <string name="preferences_export_settings_key">export_settings</string>
     <string name="preferences_swap_cross_moon_key">swap_cross_moon</string>
+    <string name="preferences_ultra_low_latency_key">ultra_low_latency</string>
+    <string name="preferences_ultra_low_latency_title">Ultra Low Latency</string>
+    <string name="preferences_ultra_low_latency_summary">Keep the picture moving on a weak connection, showing brief artifacts instead of freezing. Works best with 720p and a lower bitrate.</string>
     <string name="preferences_resolution_key">stream_resolution</string>
     <string name="preferences_fps_key">stream_fps</string>
     <string name="preferences_bitrate_key">stream_bitrate</string>

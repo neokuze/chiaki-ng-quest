@@ -14,6 +14,12 @@
             app:icon="@drawable/ic_console_simple"/>
 
         <SwitchPreference
+            app:key="@string/preferences_ultra_low_latency_key"
+            app:title="@string/preferences_ultra_low_latency_title"
+            app:summary="@string/preferences_ultra_low_latency_summary"
+            app:icon="@drawable/ic_bitrate" />
+
+        <SwitchPreference
             app:key="@string/preferences_swap_cross_moon_key"
             app:title="@string/preferences_swap_cross_moon_title"
             app:summary="@string/preferences_swap_cross_moon_summary"

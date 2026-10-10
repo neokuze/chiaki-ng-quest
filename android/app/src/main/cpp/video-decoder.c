@@ -113,7 +113,13 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 	const char *mime = chiaki_codec_is_h265(decoder->target_codec) ? "video/hevc" : "video/avc";
 	CHIAKI_LOGI(decoder->log, "Initializing decoder with mime %s", mime);
 
-	decoder->codec = AMediaCodec_createDecoderByType(mime);
+	// Qualcomm (Quest) ships separate low latency decoders that output each frame as soon as it is decoded
+	const char *low_latency_name = chiaki_codec_is_h265(decoder->target_codec) ? "c2.qti.hevc.decoder.low_latency" : "c2.qti.avc.decoder.low_latency";
+	decoder->codec = AMediaCodec_createCodecByName(low_latency_name);
+	if(decoder->codec)
+		CHIAKI_LOGI(decoder->log, "Using low latency decoder %s", low_latency_name);
+	else
+		decoder->codec = AMediaCodec_createDecoderByType(mime);
 	if(!decoder->codec)
 	{
 		CHIAKI_LOGE(decoder->log, "Failed to create AMediaCodec for mime type %s", mime);
@@ -124,6 +130,9 @@ void android_chiaki_video_decoder_set_surface(AndroidChiakiVideoDecoder *decoder
 	AMediaFormat_setString(format, AMEDIAFORMAT_KEY_MIME, mime);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_WIDTH, decoder->target_width);
 	AMediaFormat_setInt32(format, AMEDIAFORMAT_KEY_HEIGHT, decoder->target_height);
+	AMediaFormat_setInt32(format, "low-latency", 1);
+	AMediaFormat_setInt32(format, "vendor.qti-ext-dec-low-latency.enable", 1);
+	AMediaFormat_setInt32(format, "priority", 0); // realtime
 
 	media_status_t r = AMediaCodec_configure(decoder->codec, format, decoder->window, NULL, 0);
 	if(r != AMEDIA_OK)

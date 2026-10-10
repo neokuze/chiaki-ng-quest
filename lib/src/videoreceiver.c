@@ -279,7 +279,13 @@ static ChiakiErrorCode chiaki_video_receiver_flush_frame(ChiakiVideoReceiver *vi
 						break;
 					}
 				}
-				if(!recovered)
+				if(!recovered && video_receiver->session->connect_info.decode_through_loss)
+				{
+					// Decode against whatever the decoder still holds: a few smeared frames
+					// instead of a frozen picture until the next keyframe
+					CHIAKI_LOGV(video_receiver->log, "Missing reference frame %d for decoding frame %d, decoding anyway", (int)ref_frame_index, (int)video_receiver->frame_index_cur);
+				}
+				else if(!recovered)
 				{
 					succ = false;
 					chiaki_mutex_lock(&video_receiver->frames_lost_mutex);
