@@ -2,7 +2,10 @@
 
 package com.metallic.chiaki.session
 
+import android.content.Context
 import android.graphics.SurfaceTexture
+import android.net.wifi.WifiManager
+import android.os.Build
 import android.util.Log
 import android.view.*
 import androidx.lifecycle.LiveData
@@ -31,6 +34,15 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
 	private var surfaceTexture: SurfaceTexture? = null
 	private var surface: Surface? = null
 
+	// Without this the WiFi radio dozes while the device mostly receives, which stalls the
+	// video until something is sent again (e.g. moving a stick), and it also pauses for scans
+	@Suppress("DEPRECATION")
+	private val wifiLock: WifiManager.WifiLock? = (input.context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager)
+		?.createWifiLock(
+			if(Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) WifiManager.WIFI_MODE_FULL_LOW_LATENCY else WifiManager.WIFI_MODE_FULL_HIGH_PERF,
+			"chiaki:stream")
+		?.apply { setReferenceCounted(false) }
+
 	init
 	{
 		input.controllerStateChangedCallback = {
@@ -40,6 +52,7 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
 
 	fun shutdown()
 	{
+		wifiLock?.release()
 		session?.stop()
 		session?.dispose()
 		session = null
@@ -59,6 +72,7 @@ class StreamSession(val connectInfo: ConnectInfo, val logManager: LogManager, va
 	fun resume()
 	{
 		paused = false
+		wifiLock?.acquire()
 		if(session != null)
 			return
 		try
