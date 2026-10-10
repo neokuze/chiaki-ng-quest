@@ -264,6 +264,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_init(ChiakiSession *session, Chiaki
 	session->connect_info.enable_keyboard = connect_info->enable_keyboard;
 	session->connect_info.enable_dualsense = connect_info->enable_dualsense;
 	session->connect_info.enable_idr_on_fec_failure = connect_info->enable_idr_on_fec_failure;
+	session->connect_info.decode_through_loss = connect_info->decode_through_loss;
 
 	return CHIAKI_ERR_SUCCESS;
 

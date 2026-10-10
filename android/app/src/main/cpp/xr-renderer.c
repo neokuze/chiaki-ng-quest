@@ -41,6 +41,7 @@
 #define BTN_R3       (1 << 11)
 #define BTN_OPTIONS  (1 << 12)
 #define BTN_SHARE    (1 << 13)
+#define BTN_TOUCHPAD (1 << 14)
 #define BTN_PS       (1 << 15)
 #define BTN_MENU_OPEN (1 << 30) // not a DualSense button, stripped in XrRenderer.kt
 
@@ -517,7 +518,7 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 			XrVector2f ls = get_vec2(r, A_LSTICK);
 			XrVector2f rs = get_vec2(r, A_RSTICK);
 
-			// Menu is a modifier: Menu + A = PS, Menu + B = Share, Menu + right stick = D-pad.
+			// Menu is a modifier: Menu + A = PS, Menu + B = Share, Menu + R3 = touchpad click, Menu + right stick = D-pad.
 			// Options is only sent as a tap when Menu is released without any combo.
 			if(menu)
 			{
@@ -525,6 +526,7 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 					r->menu_combo = false;
 				if(cross) { buttons |= BTN_PS; r->menu_combo = true; }
 				if(moon) { buttons |= BTN_SHARE; r->menu_combo = true; }
+				if(get_bool(r, A_R3)) { buttons |= BTN_TOUCHPAD; r->menu_combo = true; }
 				if(rs.y > DPAD_THRESHOLD) { buttons |= BTN_DPAD_UP; r->menu_combo = true; }
 				if(rs.y < -DPAD_THRESHOLD) { buttons |= BTN_DPAD_DOWN; r->menu_combo = true; }
 				if(rs.x < -DPAD_THRESHOLD) { buttons |= BTN_DPAD_LEFT; r->menu_combo = true; }
@@ -547,7 +549,7 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 			if(get_bool(r, A_PYRAMID)) buttons |= BTN_PYRAMID;
 			if(get_bool(r, A_BOX)) buttons |= BTN_BOX;
 			if(get_bool(r, A_L3)) buttons |= BTN_L3;
-			if(get_bool(r, A_R3)) buttons |= BTN_R3;
+			if(get_bool(r, A_R3) && !menu) buttons |= BTN_R3; // Menu + R3 is the touchpad click
 			// While Menu is held the shoulders and triggers belong to the secret menu combo,
 			// so the console never sees them
 			if(!menu)
