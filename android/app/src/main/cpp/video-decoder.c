@@ -27,6 +27,7 @@ ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *dec
 	decoder->render_output = true;
 	decoder->window = NULL;
 	decoder->dummy_reader = NULL;
+	decoder->frames_out = 0;
 	return chiaki_mutex_init(&decoder->codec_mutex, false);
 }
 
@@ -227,6 +228,8 @@ static void *android_chiaki_video_decoder_output_thread_func(void *user)
 		ssize_t status = AMediaCodec_dequeueOutputBuffer(decoder->codec, &info, -1);
 		if(status >= 0)
 		{
+			if(info.size != 0)
+				decoder->frames_out++;
 			AMediaCodec_releaseOutputBuffer(decoder->codec, (size_t)status, info.size != 0 && decoder->render_output);
 			if(info.flags & AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM)
 			{

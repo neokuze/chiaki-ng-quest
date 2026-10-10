@@ -26,6 +26,7 @@ typedef struct android_chiaki_video_decoder_t
 	int32_t target_width;
 	int32_t target_height;
 	ChiakiCodec target_codec;
+	volatile uint64_t frames_out; // decoded frames, read by the Bad Network Mode monitor
 } AndroidChiakiVideoDecoder;
 
 ChiakiErrorCode android_chiaki_video_decoder_init(AndroidChiakiVideoDecoder *decoder, ChiakiLog *log, int32_t target_width, int32_t target_height, ChiakiCodec codec);
