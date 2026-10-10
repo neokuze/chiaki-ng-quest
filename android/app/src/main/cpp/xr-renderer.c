@@ -53,7 +53,8 @@
 
 // Secret menu: Menu + L1 + L2 + R1 + R2. Images come from Kotlin (XrRenderer.menuImage)
 #define MENU_IMG_SIZE 512
-#define MENU_IMG_COUNT 7 // 0 idle, 1 left, 2 up, 3 right, 4 down, 5 resize hint, 6 move hint
+#define MENU_IMG_COUNT 11 // 0 idle, 1 left, 2 up, 3 right, 4 down, 5 resize hint, 6 move hint,
+                          // 7..10 Bad Network Mode notice for 1080p, 720p, 540p, 360p
 #define MENU_SIZE_M 0.6f
 #define MENU_DISTANCE_M 1.0f
 #define MENU_DIR_THRESHOLD 0.6f
@@ -113,6 +114,7 @@ typedef struct XrRenderer
 	bool prev_confirm, prev_combo;
 	bool release_guard; // menu just closed: keep the pad neutral until everything is let go
 	bool user_exit;
+	volatile int notice; // menu image shown over the screen while no menu is open, -1 = none
 } XrRenderer;
 
 #define XR_CHECK(expr) do { XrResult _r = (expr); if(XR_FAILED(_r)) { LOGE("%s failed: %d", #expr, (int)_r); goto fail; } } while(0)
@@ -772,9 +774,11 @@ static void *xr_thread(void *user)
 		uint32_t layer_count = 1;
 
 		XrCompositionLayerQuad menu = { XR_TYPE_COMPOSITION_LAYER_QUAD };
-		if(r->mode != MODE_NONE && frame_state.shouldRender)
+		int notice = r->notice;
+		bool show_notice = r->mode == MODE_NONE && notice >= 0 && notice < MENU_IMG_COUNT;
+		if((r->mode != MODE_NONE || show_notice) && frame_state.shouldRender && r->menu_swapchain != XR_NULL_HANDLE)
 		{
-			int img = r->mode == MODE_RESIZE ? 5 : r->mode == MODE_MOVE ? 6 : r->menu_dir;
+			int img = show_notice ? notice : r->mode == MODE_RESIZE ? 5 : r->mode == MODE_MOVE ? 6 : r->menu_dir;
 			menu_draw(r, img);
 			menu.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 			menu.space = r->space;
@@ -784,6 +788,12 @@ static void *xr_thread(void *user)
 			menu.subImage.imageRect.extent.height = MENU_IMG_SIZE;
 			menu.pose = r->menu_pose;
 			menu.size.width = menu.size.height = MENU_SIZE_M;
+			if(show_notice)
+			{
+				// Centred on the virtual screen, composited on top of it
+				menu.pose = r->screen_pose;
+				menu.size.width = menu.size.height = r->screen_width * 0.45f;
+			}
 			layers[layer_count++] = (XrCompositionLayerBaseHeader *)&menu;
 		}
 
@@ -830,6 +840,7 @@ JNIEXPORT jlong JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeStart(J
 	r->screen_pose.orientation.w = 1.0f;
 	r->screen_pose.position.z = -SCREEN_DISTANCE_M;
 	r->screen_width = SCREEN_WIDTH_M;
+	r->notice = -1;
 	r->screen_distance = SCREEN_DISTANCE_M;
 	r->egl_display = EGL_NO_DISPLAY;
 	r->egl_context = EGL_NO_CONTEXT;
@@ -842,6 +853,13 @@ JNIEXPORT jlong JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeStart(J
 		return 0;
 	}
 	return (jlong)r;
+}
+
+JNIEXPORT void JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeSetNotice(JNIEnv *env, jobject obj, jlong ptr, jint img)
+{
+	XrRenderer *r = (XrRenderer *)ptr;
+	if(r)
+		r->notice = img;
 }
 
 JNIEXPORT void JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeStop(JNIEnv *env, jobject obj, jlong ptr)

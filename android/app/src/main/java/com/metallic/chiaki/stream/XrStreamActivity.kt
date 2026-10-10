@@ -46,6 +46,7 @@ class XrStreamActivity : ComponentActivity()
 		})[StreamViewModel::class.java]
 		viewModel.input.observe(this)
 
+		viewModel.session.notice.observe(this, Observer { renderer?.setNotice(it) })
 		viewModel.session.state.observe(this, Observer {
 			when(it)
 			{

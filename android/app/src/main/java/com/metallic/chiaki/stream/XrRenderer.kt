@@ -31,6 +31,7 @@ class XrRenderer(
 	{
 		init { System.loadLibrary("chiaki-jni") }
 		private const val MENU_OPEN_BIT = 1 shl 30
+		private val NOTICE_RESOLUTIONS = listOf("1080p", "720p", "540p", "360p")
 	}
 
 	private val mainHandler = Handler(Looper.getMainLooper())
@@ -52,6 +53,15 @@ class XrRenderer(
 		if(ptr != 0L)
 			nativeStop(ptr)
 		ptr = 0L
+	}
+
+	/** Shows the Bad Network Mode notice for the resolution named in [text], or hides it */
+	fun setNotice(text: String?)
+	{
+		if(ptr == 0L)
+			return
+		val i = if(text == null) -1 else NOTICE_RESOLUTIONS.indexOfFirst { text.contains(it) }
+		nativeSetNotice(ptr, if(i < 0) -1 else 7 + i)
 	}
 
 	@Suppress("unused") // called from native
@@ -124,6 +134,17 @@ class XrRenderer(
 			typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
 		}
 
+		if(index >= 7)
+		{
+			// Bad Network Mode notice, shown over the stream while it reconnects
+			c.drawRect(0f, 0f, size.toFloat(), size.toFloat(), smoke(mid, mid, mid))
+			val res = NOTICE_RESOLUTIONS.getOrElse(index - 7) { "" }
+			c.drawText("ADJUSTING QUALITY", mid, 226f * s, title)
+			c.drawLine(mid - 70f * s, 248f * s, mid + 70f * s, 248f * s, ring)
+			c.drawText(res, mid, 290f * s, label)
+			return toBytes(bmp)
+		}
+
 		if(index >= 5)
 		{
 			c.drawRect(0f, 0f, size.toFloat(), size.toFloat(), smoke(mid, mid, mid))
@@ -177,4 +198,5 @@ class XrRenderer(
 
 	private external fun nativeStart(activity: Activity, width: Int, height: Int): Long
 	private external fun nativeStop(ptr: Long)
+	private external fun nativeSetNotice(ptr: Long, img: Int)
 }
