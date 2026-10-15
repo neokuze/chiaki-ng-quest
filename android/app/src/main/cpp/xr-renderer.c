@@ -74,6 +74,11 @@
 #define HOLD_BAR_X1 406
 #define HOLD_BAR_Y0 300
 #define HOLD_BAR_Y1 310
+// Scenes behind the screen: 0 black, 1 passthrough, 2.. panoramas (XrRenderer.panoramaImage)
+#define SCENE_BLACK 0
+#define SCENE_PASSTHROUGH 1
+#define SCENE_PANORAMA0 2
+
 #define MENU_SIZE_M 0.6f
 #define MENU_DISTANCE_M 1.0f
 #define MENU_DIR_THRESHOLD 0.6f
@@ -134,6 +139,24 @@ typedef struct XrRenderer
 	bool release_guard; // menu just closed: keep the pad neutral until everything is let go
 	bool user_exit;
 	volatile int notice; // menu image shown over the screen while no menu is open, -1 = none
+
+	// Scene behind the screen
+	bool passthrough_ext, equirect_ext;
+	XrPassthroughFB passthrough;
+	XrPassthroughLayerFB passthrough_layer;
+	bool passthrough_running;
+	PFN_xrPassthroughStartFB pt_start;
+	PFN_xrPassthroughPauseFB pt_pause;
+	PFN_xrPassthroughLayerResumeFB pt_layer_resume;
+	PFN_xrPassthroughLayerPauseFB pt_layer_pause;
+	PFN_xrDestroyPassthroughFB pt_destroy;
+	PFN_xrDestroyPassthroughLayerFB pt_layer_destroy;
+	int scene, scene_count, scene_applied;
+	bool scene_next; // set by the secret menu, handled on the render thread
+	XrSwapchain pano_swapchain;
+	int pano_w, pano_h, pano_loaded; // scene index in the swapchain, -1 = none
+	bool prev_back;
+	jmethodID panorama_count, panorama_image, saved_scene, save_scene;
 
 	// Touchpad mode (Quest controllers)
 	double menu_down_time;
@@ -358,6 +381,9 @@ static bool handle_menu(XrRenderer *r)
 	bool confirm = get_bool(r, A_CROSS);
 	bool confirm_edge = confirm && !r->prev_confirm;
 	bool combo_edge = combo && !r->prev_combo;
+	bool back = get_bool(r, A_MOON);
+	bool back_edge = back && !r->prev_back;
+	r->prev_back = back;
 	r->prev_confirm = confirm;
 	r->prev_combo = combo;
 
@@ -408,12 +434,15 @@ static bool handle_menu(XrRenderer *r)
 				switch(r->menu_dir)
 				{
 					case 1: r->mode = MODE_RESIZE; break;
-					case 2: r->mode = MODE_NONE; break;
+					case 2: r->scene_next = true; break; // stays open to keep cycling
 					case 3: r->mode = MODE_MOVE; break;
 					case 4: r->mode = MODE_NONE; r->user_exit = true; r->quit = true; break;
 				}
-				r->menu_dir = 0;
+				if(r->mode != MODE_MENU)
+					r->menu_dir = 0;
 			}
+			else if(back_edge)
+				r->mode = MODE_NONE;
 			break;
 		}
 		case MODE_RESIZE:
@@ -443,6 +472,172 @@ static bool handle_menu(XrRenderer *r)
 	if(r->mode == MODE_NONE)
 		r->release_guard = true;
 	return true;
+}
+
+#define GET_PROC(name, dst) xrGetInstanceProcAddr(r->instance, name, (PFN_xrVoidFunction *)&(dst))
+
+static void passthrough_init(XrRenderer *r)
+{
+	if(!r->passthrough_ext)
+		return;
+	PFN_xrCreatePassthroughFB create = NULL;
+	PFN_xrCreatePassthroughLayerFB create_layer = NULL;
+	GET_PROC("xrCreatePassthroughFB", create);
+	GET_PROC("xrCreatePassthroughLayerFB", create_layer);
+	GET_PROC("xrPassthroughStartFB", r->pt_start);
+	GET_PROC("xrPassthroughPauseFB", r->pt_pause);
+	GET_PROC("xrPassthroughLayerResumeFB", r->pt_layer_resume);
+	GET_PROC("xrPassthroughLayerPauseFB", r->pt_layer_pause);
+	GET_PROC("xrDestroyPassthroughFB", r->pt_destroy);
+	GET_PROC("xrDestroyPassthroughLayerFB", r->pt_layer_destroy);
+	if(!create || !create_layer || !r->pt_start || !r->pt_pause || !r->pt_layer_resume || !r->pt_layer_pause)
+	{
+		r->passthrough_ext = false;
+		return;
+	}
+	XrPassthroughCreateInfoFB info = { XR_TYPE_PASSTHROUGH_CREATE_INFO_FB };
+	XrResult res = create(r->session, &info, &r->passthrough);
+	if(XR_SUCCEEDED(res))
+	{
+		XrPassthroughLayerCreateInfoFB layer_info = { XR_TYPE_PASSTHROUGH_LAYER_CREATE_INFO_FB };
+		layer_info.passthrough = r->passthrough;
+		layer_info.purpose = XR_PASSTHROUGH_LAYER_PURPOSE_RECONSTRUCTION_FB;
+		res = create_layer(r->session, &layer_info, &r->passthrough_layer);
+	}
+	LOGI("Passthrough setup: %d", (int)res);
+	if(XR_FAILED(res))
+		r->passthrough_ext = false;
+}
+
+static void passthrough_set(XrRenderer *r, bool on)
+{
+	if(!r->passthrough_ext || on == r->passthrough_running)
+		return;
+	if(on)
+	{
+		r->pt_start(r->passthrough);
+		r->pt_layer_resume(r->passthrough_layer);
+	}
+	else
+	{
+		r->pt_layer_pause(r->passthrough_layer);
+		r->pt_pause(r->passthrough);
+	}
+	r->passthrough_running = on;
+}
+
+static bool scene_available(XrRenderer *r, int scene)
+{
+	if(scene == SCENE_PASSTHROUGH)
+		return r->passthrough_ext;
+	if(scene >= SCENE_PANORAMA0)
+		return r->equirect_ext;
+	return true;
+}
+
+// Panorama from Kotlin: 8 byte header (width, height as little endian ints), then RGBA rows top first
+static bool panorama_load(XrRenderer *r, JNIEnv *env, int scene)
+{
+	jbyteArray arr = (*env)->CallObjectMethod(env, r->callback, r->panorama_image, scene - SCENE_PANORAMA0);
+	if(!arr)
+		return false;
+	jsize len = (*env)->GetArrayLength(env, arr);
+	jbyte *data = (*env)->GetByteArrayElements(env, arr, NULL);
+	int w = 0, h = 0;
+	memcpy(&w, data, 4);
+	memcpy(&h, data + 4, 4);
+	bool ok = false;
+	if(w > 0 && h > 0 && len >= 8 + w * h * 4)
+	{
+		if(r->pano_swapchain != XR_NULL_HANDLE)
+			xrDestroySwapchain(r->pano_swapchain);
+		r->pano_swapchain = XR_NULL_HANDLE;
+		XrSwapchainCreateInfo info = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+		info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT;
+		info.format = GL_SRGB8_ALPHA8; // photos are sRGB
+		info.width = (uint32_t)w;
+		info.height = (uint32_t)h;
+		info.sampleCount = info.faceCount = info.arraySize = info.mipCount = 1;
+		XrResult res = xrCreateSwapchain(r->session, &info, &r->pano_swapchain);
+		if(XR_FAILED(res))
+		{
+			info.format = GL_RGBA8;
+			res = xrCreateSwapchain(r->session, &info, &r->pano_swapchain);
+		}
+		if(XR_SUCCEEDED(res))
+		{
+			GLuint tex, fbo[2];
+			glGenTextures(1, &tex);
+			glBindTexture(GL_TEXTURE_2D, tex);
+			glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data + 8);
+			glGenFramebuffers(2, fbo);
+			uint32_t index = 0;
+			XrSwapchainImageAcquireInfo acq = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+			XrSwapchainImageWaitInfo wait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+			wait.timeout = XR_INFINITE_DURATION;
+			XrSwapchainImageOpenGLESKHR images[8];
+			for(int i = 0; i < 8; i++)
+				images[i] = (XrSwapchainImageOpenGLESKHR){ XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR };
+			uint32_t n = 0;
+			xrEnumerateSwapchainImages(r->pano_swapchain, 8, &n, (XrSwapchainImageBaseHeader *)images);
+			// Fill every image so it never matters which one the runtime shows
+			for(uint32_t k = 0; k < n; k++)
+			{
+				if(XR_FAILED(xrAcquireSwapchainImage(r->pano_swapchain, &acq, &index)))
+					break;
+				xrWaitSwapchainImage(r->pano_swapchain, &wait);
+				glBindFramebuffer(GL_READ_FRAMEBUFFER, fbo[0]);
+				glFramebufferTexture2D(GL_READ_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, tex, 0);
+				glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fbo[1]);
+				glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, images[index].image, 0);
+				glBlitFramebuffer(0, 0, w, h, 0, h, w, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+				glFinish();
+				XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+				xrReleaseSwapchainImage(r->pano_swapchain, &rel);
+			}
+			glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			glDeleteFramebuffers(2, fbo);
+			glDeleteTextures(1, &tex);
+			r->pano_w = w;
+			r->pano_h = h;
+			ok = true;
+		}
+		LOGI("Panorama %d (%dx%d): %d", scene - SCENE_PANORAMA0, w, h, (int)res);
+	}
+	(*env)->ReleaseByteArrayElements(env, arr, data, JNI_ABORT);
+	(*env)->DeleteLocalRef(env, arr);
+	return ok;
+}
+
+static void scene_apply(XrRenderer *r, JNIEnv *env)
+{
+	if(r->scene_next)
+	{
+		r->scene_next = false;
+		int s = r->scene;
+		for(int i = 0; i < r->scene_count; i++)
+		{
+			s = (s + 1) % r->scene_count;
+			if(scene_available(r, s))
+				break;
+		}
+		r->scene = s;
+		(*env)->CallVoidMethod(env, r->callback, r->save_scene, s);
+	}
+	if(r->scene == r->scene_applied)
+		return;
+	if(!scene_available(r, r->scene))
+		r->scene = SCENE_BLACK;
+	if(r->scene >= SCENE_PANORAMA0 && r->pano_loaded != r->scene)
+	{
+		if(panorama_load(r, env, r->scene))
+			r->pano_loaded = r->scene;
+		else
+			r->scene = SCENE_BLACK;
+	}
+	passthrough_set(r, r->scene == SCENE_PASSTHROUGH);
+	r->scene_applied = r->scene;
+	LOGI("Scene %d", r->scene);
 }
 
 // Loads the menu images from Kotlin into GL textures and creates the menu swapchain
@@ -779,16 +974,25 @@ static void *xr_thread(void *user)
 		ext_props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
 	xrEnumerateInstanceExtensionProperties(NULL, ext_count, &ext_count, ext_props);
 	for(uint32_t i = 0; i < ext_count; i++)
+	{
 		if(!strcmp(ext_props[i].extensionName, XR_FB_COMPOSITION_LAYER_IMAGE_LAYOUT_EXTENSION_NAME))
 			r->flip_ext = true;
+		else if(!strcmp(ext_props[i].extensionName, XR_FB_PASSTHROUGH_EXTENSION_NAME))
+			r->passthrough_ext = true;
+		else if(!strcmp(ext_props[i].extensionName, XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME))
+			r->equirect_ext = true;
+	}
 	free(ext_props);
-	LOGI("Image layout flip extension: %d", r->flip_ext);
-	const char *exts[] = {
+	LOGI("Extensions: image layout flip %d, passthrough %d, equirect2 %d", r->flip_ext, r->passthrough_ext, r->equirect_ext);
+	const char *exts[6] = {
 		XR_KHR_ANDROID_CREATE_INSTANCE_EXTENSION_NAME,
 		XR_KHR_OPENGL_ES_ENABLE_EXTENSION_NAME,
 		XR_KHR_ANDROID_SURFACE_SWAPCHAIN_EXTENSION_NAME,
-		XR_FB_COMPOSITION_LAYER_IMAGE_LAYOUT_EXTENSION_NAME,
 	};
+	uint32_t ext_used = 3;
+	if(r->flip_ext) exts[ext_used++] = XR_FB_COMPOSITION_LAYER_IMAGE_LAYOUT_EXTENSION_NAME;
+	if(r->passthrough_ext) exts[ext_used++] = XR_FB_PASSTHROUGH_EXTENSION_NAME;
+	if(r->equirect_ext) exts[ext_used++] = XR_KHR_COMPOSITION_LAYER_EQUIRECT2_EXTENSION_NAME;
 	XrInstanceCreateInfoAndroidKHR android_info = { XR_TYPE_INSTANCE_CREATE_INFO_ANDROID_KHR };
 	android_info.applicationVM = r->vm;
 	android_info.applicationActivity = r->activity;
@@ -796,7 +1000,7 @@ static void *xr_thread(void *user)
 	inst_info.next = &android_info;
 	strcpy(inst_info.applicationInfo.applicationName, "Chiaki Immersive");
 	inst_info.applicationInfo.apiVersion = XR_API_VERSION_1_0;
-	inst_info.enabledExtensionCount = sizeof(exts) / sizeof(exts[0]) - (r->flip_ext ? 0 : 1);
+	inst_info.enabledExtensionCount = ext_used;
 	inst_info.enabledExtensionNames = exts;
 	XR_CHECK(xrCreateInstance(&inst_info, &r->instance));
 
@@ -827,6 +1031,14 @@ static void *xr_thread(void *user)
 		LOGE("Controller input setup failed, only physical gamepads will work");
 	if(!menu_init(r, env))
 		LOGE("Secret menu setup failed");
+
+	passthrough_init(r);
+	r->scene_count = SCENE_PANORAMA0 + (*env)->CallIntMethod(env, r->callback, r->panorama_count);
+	r->scene = (*env)->CallIntMethod(env, r->callback, r->saved_scene);
+	if(r->scene < 0 || r->scene >= r->scene_count)
+		r->scene = SCENE_BLACK;
+	r->scene_applied = -1;
+	r->pano_loaded = -1;
 
 	PFN_xrCreateSwapchainAndroidSurfaceKHR create_surface_swapchain = NULL;
 	XR_CHECK(xrGetInstanceProcAddr(r->instance, "xrCreateSwapchainAndroidSurfaceKHR", (PFN_xrVoidFunction *)&create_surface_swapchain));
@@ -898,6 +1110,7 @@ static void *xr_thread(void *user)
 
 		frame_time = frame_state.predictedDisplayTime;
 		poll_input(r, env);
+		scene_apply(r, env);
 
 		XrCompositionLayerImageLayoutFB layout = { XR_TYPE_COMPOSITION_LAYER_IMAGE_LAYOUT_FB };
 		layout.flags = XR_COMPOSITION_LAYER_IMAGE_LAYOUT_VERTICAL_FLIP_BIT_FB;
@@ -918,8 +1131,32 @@ static void *xr_thread(void *user)
 		}
 		quad.size.width = r->screen_width;
 		quad.size.height = r->screen_width * (float)r->height / (float)r->width;
-		const XrCompositionLayerBaseHeader *layers[2] = { (XrCompositionLayerBaseHeader *)&quad };
-		uint32_t layer_count = 1;
+		const XrCompositionLayerBaseHeader *layers[3];
+		uint32_t layer_count = 0;
+
+		XrCompositionLayerPassthroughFB pt_layer = { XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB };
+		XrCompositionLayerEquirect2KHR pano = { XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR };
+		if(r->scene_applied == SCENE_PASSTHROUGH && r->passthrough_running)
+		{
+			pt_layer.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+			pt_layer.layerHandle = r->passthrough_layer;
+			layers[layer_count++] = (XrCompositionLayerBaseHeader *)&pt_layer;
+		}
+		else if(r->scene_applied >= SCENE_PANORAMA0 && r->pano_swapchain != XR_NULL_HANDLE)
+		{
+			pano.space = r->space;
+			pano.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
+			pano.subImage.swapchain = r->pano_swapchain;
+			pano.subImage.imageRect.extent.width = r->pano_w;
+			pano.subImage.imageRect.extent.height = r->pano_h;
+			pano.pose.orientation.w = 1.0f;
+			pano.radius = 0.0f; // infinitely far away
+			pano.centralHorizontalAngle = 2.0f * (float)M_PI;
+			pano.upperVerticalAngle = 0.5f * (float)M_PI;
+			pano.lowerVerticalAngle = -0.5f * (float)M_PI;
+			layers[layer_count++] = (XrCompositionLayerBaseHeader *)&pano;
+		}
+		layers[layer_count++] = (XrCompositionLayerBaseHeader *)&quad;
 
 		XrCompositionLayerQuad menu = { XR_TYPE_COMPOSITION_LAYER_QUAD };
 		// Over the screen while no menu is open: touchpad overlay first, then the notice
@@ -971,6 +1208,9 @@ fail:
 	(*env)->CallVoidMethod(env, r->callback, r->on_surface, NULL);
 	if(r->swapchain != XR_NULL_HANDLE) xrDestroySwapchain(r->swapchain);
 	if(r->menu_swapchain != XR_NULL_HANDLE) xrDestroySwapchain(r->menu_swapchain);
+	if(r->pano_swapchain != XR_NULL_HANDLE) xrDestroySwapchain(r->pano_swapchain);
+	if(r->passthrough_layer != XR_NULL_HANDLE && r->pt_layer_destroy) r->pt_layer_destroy(r->passthrough_layer);
+	if(r->passthrough != XR_NULL_HANDLE && r->pt_destroy) r->pt_destroy(r->passthrough);
 	if(r->view_space != XR_NULL_HANDLE) xrDestroySpace(r->view_space);
 	if(r->action_set != XR_NULL_HANDLE) xrDestroyActionSet(r->action_set);
 	if(r->space != XR_NULL_HANDLE) xrDestroySpace(r->space);
@@ -997,6 +1237,10 @@ JNIEXPORT jlong JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeStart(J
 	r->on_input = (*env)->GetMethodID(env, cls, "onInput", "(IIISSSSII)V");
 	r->on_exit = (*env)->GetMethodID(env, cls, "onExit", "()V");
 	r->menu_image = (*env)->GetMethodID(env, cls, "menuImage", "(II)[B");
+	r->panorama_count = (*env)->GetMethodID(env, cls, "panoramaCount", "()I");
+	r->panorama_image = (*env)->GetMethodID(env, cls, "panoramaImage", "(I)[B");
+	r->saved_scene = (*env)->GetMethodID(env, cls, "savedScene", "()I");
+	r->save_scene = (*env)->GetMethodID(env, cls, "saveScene", "(I)V");
 	r->width = width;
 	r->height = height;
 	r->screen_pose.orientation.w = 1.0f;

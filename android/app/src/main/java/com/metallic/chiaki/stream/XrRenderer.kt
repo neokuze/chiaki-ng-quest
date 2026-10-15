@@ -14,7 +14,11 @@ import java.nio.ByteBuffer
 import android.os.Handler
 import android.os.Looper
 import android.view.Surface
+import android.graphics.BitmapFactory
+import android.graphics.LinearGradient
 import android.graphics.RectF
+import java.io.File
+import java.nio.ByteOrder
 import com.metallic.chiaki.lib.ControllerState
 import com.metallic.chiaki.lib.ControllerTouch
 
@@ -34,6 +38,7 @@ class XrRenderer(
 		init { System.loadLibrary("chiaki-jni") }
 		private const val MENU_OPEN_BIT = 1 shl 30
 		private val NOTICE_RESOLUTIONS = listOf("1080p", "720p", "540p", "360p")
+		private const val PANORAMA_MAX_WIDTH = 4096
 	}
 
 	private val mainHandler = Handler(Looper.getMainLooper())
@@ -218,7 +223,7 @@ class XrRenderer(
 		// left, up, right, down
 		val opts = listOf(
 			Triple(118f, 256f, "RESIZE"),
-			Triple(256f, 118f, "CLOSE"),
+			Triple(256f, 118f, "SCENE"),
 			Triple(394f, 256f, "MOVE"),
 			Triple(256f, 394f, "EXIT"))
 		val glow = Paint(Paint.ANTI_ALIAS_FLAG)
@@ -240,7 +245,88 @@ class XrRenderer(
 		c.drawCircle(mid + dx, mid + dy, 30f * s, knob)
 		c.drawCircle(mid + dx, mid + dy, 30f * s, ring)
 		c.drawText("A", mid + dx, mid + dy + 9f * s, caption)
+		c.drawText("B  ·  close", mid, 492f * s, caption)
 		return toBytes(bmp)
+	}
+
+	// --- Scenes behind the screen: panoramas for the native equirect layer ---
+
+	private val prefs by lazy { activity.getSharedPreferences("immersive", Activity.MODE_PRIVATE) }
+
+	/** Equirectangular photos the user put in Android/data/<app>/files/panoramas */
+	private val panoramaFiles: List<File> by lazy {
+		val dir = activity.getExternalFilesDir("panoramas")
+		dir?.mkdirs()
+		dir?.listFiles { f -> f.isFile && f.extension.lowercase() in listOf("jpg", "jpeg", "png", "webp") }
+			?.sortedBy { it.name.lowercase() } ?: listOf()
+	}
+
+	@Suppress("unused") // called from native
+	private fun panoramaCount(): Int = 1 + panoramaFiles.size // built-in night sky first
+
+	@Suppress("unused") // called from native
+	private fun savedScene(): Int = prefs.getInt("scene", 0)
+
+	@Suppress("unused") // called from native
+	private fun saveScene(scene: Int) = prefs.edit().putInt("scene", scene).apply()
+
+	/** 8 byte header (width, height, little endian) followed by RGBA rows, top first */
+	@Suppress("unused") // called from native
+	private fun panoramaImage(index: Int): ByteArray?
+	{
+		val bmp = try
+		{
+			if(index == 0) nightSky() else decodePanorama(panoramaFiles[index - 1])
+		}
+		catch(e: Throwable) { null } ?: return null
+		val header = ByteBuffer.allocate(8).order(ByteOrder.LITTLE_ENDIAN).putInt(bmp.width).putInt(bmp.height).array()
+		return header + toBytes(bmp)
+	}
+
+	private fun decodePanorama(file: File): Bitmap?
+	{
+		val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+		BitmapFactory.decodeFile(file.absolutePath, bounds)
+		var sample = 1
+		while(bounds.outWidth / sample > PANORAMA_MAX_WIDTH)
+			sample *= 2
+		val opts = BitmapFactory.Options().apply {
+			inSampleSize = sample
+			inPreferredConfig = Bitmap.Config.ARGB_8888
+		}
+		val bmp = BitmapFactory.decodeFile(file.absolutePath, opts) ?: return null
+		return if(bmp.config == Bitmap.Config.ARGB_8888) bmp else bmp.copy(Bitmap.Config.ARGB_8888, false).also { bmp.recycle() }
+	}
+
+	/** Built-in scene: a calm night sky over a dark horizon, so there is always something besides black */
+	private fun nightSky(): Bitmap
+	{
+		val w = 4096
+		val h = 2048
+		val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+		val c = Canvas(bmp)
+		val horizon = h * 0.5f
+		c.drawRect(0f, 0f, w.toFloat(), horizon, Paint().apply {
+			shader = LinearGradient(0f, 0f, 0f, horizon,
+				intArrayOf(Color.rgb(2, 3, 10), Color.rgb(8, 12, 32), Color.rgb(26, 30, 58)),
+				floatArrayOf(0f, 0.7f, 1f), Shader.TileMode.CLAMP)
+		})
+		c.drawRect(0f, horizon, w.toFloat(), h.toFloat(), Paint().apply {
+			shader = LinearGradient(0f, horizon, 0f, h.toFloat(),
+				intArrayOf(Color.rgb(14, 15, 24), Color.rgb(4, 4, 7), Color.rgb(1, 1, 2)),
+				floatArrayOf(0f, 0.25f, 1f), Shader.TileMode.CLAMP)
+		})
+		val rnd = java.util.Random(1234)
+		val star = Paint(Paint.ANTI_ALIAS_FLAG)
+		repeat(2600) {
+			// Uniform on the sphere: denser rows near the poles are compensated by asin
+			val y = (Math.asin(rnd.nextDouble()) / (Math.PI / 2) * horizon).toFloat()
+			val x = rnd.nextFloat() * w
+			val b = 90 + rnd.nextInt(166)
+			star.color = Color.argb(b, 230, 235, 255)
+			c.drawCircle(x, horizon - y, 0.6f + rnd.nextFloat() * rnd.nextFloat() * 2.2f, star)
+		}
+		return bmp
 	}
 
 	private fun toBytes(bmp: Bitmap): ByteArray
