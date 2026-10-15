@@ -69,7 +69,8 @@ data class ConnectInfo(
 	val host: String,
 	val registKey: ByteArray,
 	val morning: ByteArray,
-	val videoProfile: ConnectVideoProfile
+	val videoProfile: ConnectVideoProfile,
+	val ultraLowLatency: Boolean = false
 ): Parcelable
 
 private class ChiakiNative
@@ -91,6 +92,7 @@ private class ChiakiNative
 		@JvmStatic external fun sessionStop(ptr: Long): Int
 		@JvmStatic external fun sessionJoin(ptr: Long): Int
 		@JvmStatic external fun sessionSetSurface(ptr: Long, surface: Surface?)
+		@JvmStatic external fun sessionFramesDecoded(ptr: Long): Long
 		@JvmStatic external fun sessionSetControllerState(ptr: Long, controllerState: ControllerState)
 		@JvmStatic external fun sessionSetLoginPin(ptr: Long, pin: String)
 		@JvmStatic external fun discoveryServiceCreate(result: CreateResult, options: DiscoveryServiceOptions, javaService: DiscoveryService)
@@ -341,6 +343,7 @@ class Session(connectInfo: ConnectInfo, logFile: String?, logVerbose: Boolean)
 	}
 
 	fun start() = ErrorCode(ChiakiNative.sessionStart(nativePtr))
+	fun framesDecoded() = if(nativePtr == 0L) 0L else ChiakiNative.sessionFramesDecoded(nativePtr)
 	fun stop() = ErrorCode(ChiakiNative.sessionStop(nativePtr))
 
 	fun dispose()

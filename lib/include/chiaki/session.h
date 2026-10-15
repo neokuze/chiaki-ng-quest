@@ -89,6 +89,7 @@ typedef struct chiaki_connect_info_t
 	uint8_t psn_account_id[CHIAKI_PSN_ACCOUNT_ID_SIZE];
 	double packet_loss_max;
 	bool enable_idr_on_fec_failure;
+	bool decode_through_loss; // show artifacts instead of freezing when a reference frame is lost
 } ChiakiConnectInfo;
 
 
@@ -227,6 +228,7 @@ typedef struct chiaki_session_t
 		bool enable_dualsense;
 		uint8_t psn_account_id[CHIAKI_PSN_ACCOUNT_ID_SIZE];
 		bool enable_idr_on_fec_failure;
+		bool decode_through_loss;
 	} connect_info;
 
 	ChiakiTarget target;

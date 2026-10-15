@@ -9,6 +9,7 @@ import android.graphics.Matrix
 import android.os.*
 import android.view.*
 import android.widget.EditText
+import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.IntentCompat
 import androidx.lifecycle.lifecycleScope
@@ -118,6 +119,14 @@ class StreamActivity : AppCompatActivity()
 		//viewModel.session.attachToTextureView(textureView)
 		viewModel.session.attachToSurfaceView(binding.surfaceView)
 		viewModel.session.state.observe(this, Observer { this.stateChanged(it) })
+		val touchpadOverlay = TouchpadOverlayView(this)
+		addContentView(touchpadOverlay, android.view.ViewGroup.LayoutParams(
+			android.view.ViewGroup.LayoutParams.MATCH_PARENT, android.view.ViewGroup.LayoutParams.MATCH_PARENT))
+		viewModel.input.touchOverlayCallback = { touchpadOverlay.overlay = it }
+		viewModel.session.notice.observe(this, Observer { notice ->
+			if(notice != null)
+				Toast.makeText(this, notice, Toast.LENGTH_SHORT).show()
+		})
 		adjustStreamViewAspect()
 
 		if(Preferences(this).rumbleEnabled)

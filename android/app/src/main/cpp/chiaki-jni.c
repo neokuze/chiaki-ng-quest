@@ -230,6 +230,7 @@ JNIEXPORT void JNICALL JNI_FCN(sessionCreate)(JNIEnv *env, jobject obj, jobject 
 
 	ChiakiConnectInfo connect_info = { 0 };
 	connect_info.ps5 = ps5;
+	connect_info.decode_through_loss = E->GetBooleanField(env, connect_info_obj, E->GetFieldID(env, connect_info_class, "ultraLowLatency", "Z"));
 
 	const char *str_borrow = E->GetStringUTFChars(env, host_string, NULL);
 	connect_info.host = host_str = strdup(str_borrow);
@@ -402,6 +403,12 @@ JNIEXPORT jint JNICALL JNI_FCN(sessionJoin)(JNIEnv *env, jobject obj, jlong ptr)
 	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
 	CHIAKI_LOGI(session->log, "Join JNI Session");
 	return chiaki_session_join(&session->session);
+}
+
+JNIEXPORT jlong JNICALL JNI_FCN(sessionFramesDecoded)(JNIEnv *env, jobject obj, jlong ptr)
+{
+	AndroidChiakiSession *session = (AndroidChiakiSession *)ptr;
+	return (jlong)session->video_decoder.frames_out;
 }
 
 JNIEXPORT void JNICALL JNI_FCN(sessionSetSurface)(JNIEnv *env, jobject obj, jlong ptr, jobject surface)

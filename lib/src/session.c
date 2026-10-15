@@ -264,6 +264,7 @@ CHIAKI_EXPORT ChiakiErrorCode chiaki_session_init(ChiakiSession *session, Chiaki
 	session->connect_info.enable_keyboard = connect_info->enable_keyboard;
 	session->connect_info.enable_dualsense = connect_info->enable_dualsense;
 	session->connect_info.enable_idr_on_fec_failure = connect_info->enable_idr_on_fec_failure;
+	session->connect_info.decode_through_loss = connect_info->decode_through_loss;
 
 	return CHIAKI_ERR_SUCCESS;
 
@@ -633,7 +634,17 @@ ctrl_failed:
 	}
 
 	if(err == CHIAKI_ERR_SUCCESS)
+	{
 		CHIAKI_LOGI(session->log, "Senkusha completed successfully");
+		// Tunnels such as Tailscale/WireGuard pass the inbound MTU probe (it gets fragmented)
+		// but drop or mangle full size video packets. The path is the same both ways, so the
+		// console must not send anything larger than what we could send.
+		if(session->mtu_out && session->mtu_in > session->mtu_out)
+		{
+			CHIAKI_LOGI(session->log, "Clamping inbound MTU %u to outbound MTU %u", (unsigned)session->mtu_in, (unsigned)session->mtu_out);
+			session->mtu_in = session->mtu_out;
+		}
+	}
 	else if(err == CHIAKI_ERR_CANCELED)
 		QUIT(quit_ctrl);
 	else
