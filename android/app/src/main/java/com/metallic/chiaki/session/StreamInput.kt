@@ -10,6 +10,15 @@ import androidx.lifecycle.OnLifecycleEvent
 import com.metallic.chiaki.common.Preferences
 import com.metallic.chiaki.lib.ControllerState
 
+/** What the touchpad overlay shows: hold hint [progress] 0..1 or -1, fingers packed as x | y << 16 or -1 */
+data class TouchOverlay(val progress: Float, val active: Boolean, val finger0: Int, val finger1: Int)
+{
+	companion object
+	{
+		val NONE = TouchOverlay(-1f, false, -1, -1)
+	}
+}
+
 class StreamInput(val context: Context, val preferences: Preferences)
 {
 	var controllerStateChangedCallback: ((ControllerState) -> Unit)? = null
@@ -40,7 +49,7 @@ class StreamInput(val context: Context, val preferences: Preferences)
 		if(motionControllerState.r2State > 0U)
 			controllerState.r2State = motionControllerState.r2State
 
-		return controllerState or touchControllerState
+		return controllerState or touchControllerState or virtualTouchState
 	}
 
 	private val sensorControllerState = ControllerState() // from Motion Sensors
@@ -131,6 +140,97 @@ class StreamInput(val context: Context, val preferences: Preferences)
 	private var optionsCombo = false
 	private val handler = android.os.Handler(android.os.Looper.getMainLooper())
 
+	// --- Touchpad mode: hold Options alone, the right stick is a finger, R3 clicks ---
+	var touchOverlayCallback: ((TouchOverlay) -> Unit)? = null
+	private var touchMode = false
+	private var holdClean = false
+	private var optionsDownTime = 0L
+	private val virtualTouchState = ControllerState()
+	private val fingerIds = arrayOfNulls<UByte>(2)
+
+	private val holdTicker = object: Runnable {
+		override fun run()
+		{
+			if(!optionsHeld || !holdClean || touchMode)
+				return
+			val held = android.os.SystemClock.elapsedRealtime() - optionsDownTime
+			if(held >= TOUCH_HOLD_MS)
+			{
+				touchMode = true
+				optionsCombo = true
+				publishTouchOverlay()
+				return
+			}
+			if(held >= TOUCH_HINT_MS)
+				touchOverlayCallback?.invoke(TouchOverlay((held - TOUCH_HINT_MS).toFloat() / (TOUCH_HOLD_MS - TOUCH_HINT_MS), false, -1, -1))
+			handler.postDelayed(this, 33)
+		}
+	}
+
+	private fun cancelHold()
+	{
+		if(!holdClean)
+			return
+		holdClean = false
+		handler.removeCallbacks(holdTicker)
+		touchOverlayCallback?.invoke(TouchOverlay.NONE)
+	}
+
+	private fun endTouchMode()
+	{
+		touchMode = false
+		for(i in 0..1)
+			setFinger(i, null, null)
+		touchOverlayCallback?.invoke(TouchOverlay.NONE)
+		controllerStateUpdated()
+	}
+
+	private fun setFinger(i: Int, x: Float?, y: Float?)
+	{
+		val id = fingerIds[i]
+		if(x == null || y == null)
+		{
+			if(id != null)
+				virtualTouchState.stopTouch(id)
+			fingerIds[i] = null
+			return
+		}
+		val tx = (x.coerceIn(0f, 1f) * (ControllerState.TOUCHPAD_WIDTH - 1U).toFloat()).toUInt().toUShort()
+		val ty = (y.coerceIn(0f, 1f) * (ControllerState.TOUCHPAD_HEIGHT - 1U).toFloat()).toUInt().toUShort()
+		if(id == null)
+			fingerIds[i] = virtualTouchState.startTouch(tx, ty)
+		else
+			virtualTouchState.setTouchPos(id, tx, ty)
+	}
+
+	private fun packedFinger(i: Int): Int
+	{
+		val id = fingerIds[i] ?: return -1
+		val t = virtualTouchState.touches.find { it.id == id.toByte() } ?: return -1
+		return t.x.toInt() or (t.y.toInt() shl 16)
+	}
+
+	private fun publishTouchOverlay()
+	{
+		touchOverlayCallback?.invoke(TouchOverlay(-1f, true, packedFinger(0), packedFinger(1)))
+	}
+
+	/** A stick deflected past the dead zone is a finger down at that spot of the touchpad */
+	private fun stickFinger(i: Int, sx: Float, sy: Float)
+	{
+		if(sx * sx + sy * sy < STICK_TOUCH_DEADZONE * STICK_TOUCH_DEADZONE)
+			setFinger(i, null, null)
+		else
+			setFinger(i, (sx + 1f) * 0.5f, (sy + 1f) * 0.5f)
+	}
+
+	companion object
+	{
+		private const val TOUCH_HOLD_MS = 2800L
+		private const val TOUCH_HINT_MS = 400L
+		private const val STICK_TOUCH_DEADZONE = 0.25f
+	}
+
 	private fun handleTouchpadCombo(event: KeyEvent): Boolean
 	{
 		val down = event.action == KeyEvent.ACTION_DOWN
@@ -147,10 +247,17 @@ class StreamInput(val context: Context, val preferences: Preferences)
 				{
 					optionsHeld = true
 					optionsCombo = false
+					holdClean = true
+					optionsDownTime = android.os.SystemClock.elapsedRealtime()
+					handler.removeCallbacks(holdTicker)
+					handler.postDelayed(holdTicker, 33)
 				}
 				else
 				{
 					optionsHeld = false
+					cancelHold()
+					if(touchMode)
+						endTouchMode()
 					if(!optionsCombo)
 					{
 						setKeyButton(ControllerState.BUTTON_OPTIONS, true)
@@ -162,6 +269,7 @@ class StreamInput(val context: Context, val preferences: Preferences)
 			KeyEvent.KEYCODE_BUTTON_THUMBR -> {
 				if(down && optionsHeld)
 				{
+					cancelHold()
 					optionsCombo = true
 					setKeyButton(ControllerState.BUTTON_TOUCHPAD, true)
 					return true
@@ -184,6 +292,10 @@ class StreamInput(val context: Context, val preferences: Preferences)
 
 		if(handleTouchpadCombo(event))
 			return true
+		if(touchMode)
+			return true // only R3 and Options count while the sticks are fingers
+		if(event.action == KeyEvent.ACTION_DOWN)
+			cancelHold()
 
 		when(event.keyCode)
 		{
@@ -238,6 +350,18 @@ class StreamInput(val context: Context, val preferences: Preferences)
 			return false
 		fun Float.signedAxis() = (this * Short.MAX_VALUE).toInt().toShort()
 		fun Float.unsignedAxis() = (this * UByte.MAX_VALUE.toFloat()).toUInt().toUByte()
+		if(touchMode)
+		{
+			stickFinger(0, event.getAxisValue(MotionEvent.AXIS_Z), event.getAxisValue(MotionEvent.AXIS_RZ))
+			stickFinger(1, event.getAxisValue(MotionEvent.AXIS_X), event.getAxisValue(MotionEvent.AXIS_Y))
+			publishTouchOverlay()
+			controllerStateUpdated()
+			return true
+		}
+		if(holdClean && listOf(MotionEvent.AXIS_X, MotionEvent.AXIS_Y, MotionEvent.AXIS_Z, MotionEvent.AXIS_RZ,
+				MotionEvent.AXIS_LTRIGGER, MotionEvent.AXIS_RTRIGGER, MotionEvent.AXIS_HAT_X, MotionEvent.AXIS_HAT_Y)
+				.any { kotlin.math.abs(event.getAxisValue(it)) > 0.3f })
+			cancelHold()
 		motionControllerState.leftX = event.getAxisValue(MotionEvent.AXIS_X).signedAxis()
 		motionControllerState.leftY = event.getAxisValue(MotionEvent.AXIS_Y).signedAxis()
 		motionControllerState.rightX = event.getAxisValue(MotionEvent.AXIS_Z).signedAxis()
