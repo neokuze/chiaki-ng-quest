@@ -47,6 +47,7 @@ class XrStreamActivity : ComponentActivity()
 		viewModel.input.observe(this)
 
 		viewModel.session.notice.observe(this, Observer { renderer?.setNotice(it) })
+		viewModel.input.touchOverlayCallback = { renderer?.setTouchOverlay(it.progress, it.active, it.finger0, it.finger1) }
 		viewModel.session.state.observe(this, Observer {
 			when(it)
 			{

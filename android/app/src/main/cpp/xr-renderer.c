@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <time.h>
 #include <unistd.h>
 #include <android/log.h>
 
@@ -53,8 +54,26 @@
 
 // Secret menu: Menu + L1 + L2 + R1 + R2. Images come from Kotlin (XrRenderer.menuImage)
 #define MENU_IMG_SIZE 512
-#define MENU_IMG_COUNT 11 // 0 idle, 1 left, 2 up, 3 right, 4 down, 5 resize hint, 6 move hint,
-                          // 7..10 Bad Network Mode notice for 1080p, 720p, 540p, 360p
+#define MENU_IMG_COUNT 13 // 0 idle, 1 left, 2 up, 3 right, 4 down, 5 resize hint, 6 move hint,
+                          // 7..10 Bad Network Mode notice for 1080p, 720p, 540p, 360p,
+                          // 11 touchpad panel, 12 touchpad hold hint
+#define IMG_TOUCHPAD 11
+#define IMG_TOUCH_HOLD 12
+
+// Touchpad mode: hold Menu alone, thumbs on the sticks become fingers on the touchpad
+#define TOUCH_HOLD_S 2.8
+#define TOUCH_HINT_S 0.4 // the hold hint shows up after this, so a plain Options tap stays clean
+#define TOUCHPAD_W 1920
+#define TOUCHPAD_H 942
+// Panel rectangle and hold bar inside the menu images, top-left origin (see XrRenderer.menuImage)
+#define PANEL_X0 56
+#define PANEL_X1 456
+#define PANEL_Y0 158
+#define PANEL_Y1 354
+#define HOLD_BAR_X0 106
+#define HOLD_BAR_X1 406
+#define HOLD_BAR_Y0 300
+#define HOLD_BAR_Y1 310
 #define MENU_SIZE_M 0.6f
 #define MENU_DISTANCE_M 1.0f
 #define MENU_DIR_THRESHOLD 0.6f
@@ -63,7 +82,7 @@ enum { MODE_NONE, MODE_MENU, MODE_RESIZE, MODE_MOVE };
 
 enum {
 	A_CROSS, A_MOON, A_BOX, A_PYRAMID, A_L3, A_R3, A_MENU,
-	A_L2, A_R2, A_L1, A_R1, A_LSTICK, A_RSTICK, A_COUNT
+	A_L2, A_R2, A_L1, A_R1, A_LSTICK, A_RSTICK, A_LTOUCH, A_RTOUCH, A_COUNT
 };
 
 typedef struct XrRenderer
@@ -115,6 +134,18 @@ typedef struct XrRenderer
 	bool release_guard; // menu just closed: keep the pad neutral until everything is let go
 	bool user_exit;
 	volatile int notice; // menu image shown over the screen while no menu is open, -1 = none
+
+	// Touchpad mode (Quest controllers)
+	double menu_down_time;
+	bool hold_clean; // Menu held alone since it went down
+	float hold_progress; // 0..1 while the hold hint shows, -1 otherwise
+	bool touch_mode;
+	int finger[2]; // touchpad position packed as x | y << 16, -1 = lifted
+
+	// Touchpad overlay requested from Kotlin (gamepad touchpad mode)
+	volatile float ext_progress;
+	volatile bool ext_active;
+	volatile int ext_finger[2];
 } XrRenderer;
 
 #define XR_CHECK(expr) do { XrResult _r = (expr); if(XR_FAILED(_r)) { LOGE("%s failed: %d", #expr, (int)_r); goto fail; } } while(0)
@@ -192,6 +223,8 @@ static bool input_init(XrRenderer *r)
 		{ A_R1,      "r1",      XR_ACTION_TYPE_FLOAT_INPUT,   "/user/hand/right/input/squeeze/value" },
 		{ A_LSTICK,  "lstick",  XR_ACTION_TYPE_VECTOR2F_INPUT, "/user/hand/left/input/thumbstick" },
 		{ A_RSTICK,  "rstick",  XR_ACTION_TYPE_VECTOR2F_INPUT, "/user/hand/right/input/thumbstick" },
+		{ A_LTOUCH,  "ltouch",  XR_ACTION_TYPE_BOOLEAN_INPUT, "/user/hand/left/input/thumbstick/touch" },
+		{ A_RTOUCH,  "rtouch",  XR_ACTION_TYPE_BOOLEAN_INPUT, "/user/hand/right/input/thumbstick/touch" },
 	};
 
 	XrActionSuggestedBinding bindings[A_COUNT];
@@ -459,9 +492,54 @@ static bool menu_init(XrRenderer *r, JNIEnv *env)
 	return true;
 }
 
+static double now_s(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static int pack_finger(XrVector2f v)
+{
+	float x = (v.x + 1.0f) * 0.5f, y = (1.0f - v.y) * 0.5f; // stick up = top of the touchpad
+	if(x < 0.0f) x = 0.0f; if(x > 1.0f) x = 1.0f;
+	if(y < 0.0f) y = 0.0f; if(y > 1.0f) y = 1.0f;
+	return (int)(x * (TOUCHPAD_W - 1)) | ((int)(y * (TOUCHPAD_H - 1)) << 16);
+}
+
+// Rect in image pixels with top-left origin, drawn into the bound draw framebuffer (bottom-left origin)
+static void fill_rect(int x0, int y0, int x1, int y1, float a)
+{
+	glScissor(x0, MENU_IMG_SIZE - y1, x1 - x0, y1 - y0);
+	glClearColor(a, a, a, a); // premultiplied white
+	glClear(GL_COLOR_BUFFER_BIT);
+}
+
+static void draw_finger(int packed, float a)
+{
+	if(packed < 0)
+		return;
+	int fx = PANEL_X0 + (packed & 0xffff) * (PANEL_X1 - PANEL_X0) / (TOUCHPAD_W - 1);
+	int fy = PANEL_Y0 + (packed >> 16) * (PANEL_Y1 - PANEL_Y0) / (TOUCHPAD_H - 1);
+	const int rad = 11;
+	for(int dy = -rad; dy < rad; dy += 2)
+	{
+		int half = (int)sqrtf((float)(rad * rad - dy * dy));
+		fill_rect(fx - half, fy + dy, fx + half, fy + dy + 2, a);
+	}
+}
+
+static void menu_draw_ex(XrRenderer *r, int img, float progress, const int *fingers);
+
 static void menu_draw(XrRenderer *r, int img)
 {
-	if(img == r->menu_shown_img)
+	menu_draw_ex(r, img, -1.0f, NULL);
+}
+
+static void menu_draw_ex(XrRenderer *r, int img, float progress, const int *fingers)
+{
+	bool dynamic = progress >= 0.0f || fingers;
+	if(img == r->menu_shown_img && !dynamic)
 		return; // the last released image is still valid
 	uint32_t index = 0;
 	XrSwapchainImageAcquireInfo acq = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
@@ -484,12 +562,24 @@ static void menu_draw(XrRenderer *r, int img)
 		glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, images[index].image, 0);
 		// Bitmaps are top row first, GL images bottom row first
 		glBlitFramebuffer(0, 0, MENU_IMG_SIZE, MENU_IMG_SIZE, 0, MENU_IMG_SIZE, MENU_IMG_SIZE, 0, GL_COLOR_BUFFER_BIT, GL_LINEAR);
+		if(dynamic)
+		{
+			glEnable(GL_SCISSOR_TEST);
+			if(progress >= 0.0f)
+				fill_rect(HOLD_BAR_X0, HOLD_BAR_Y0, HOLD_BAR_X0 + (int)((HOLD_BAR_X1 - HOLD_BAR_X0) * progress), HOLD_BAR_Y1, 0.85f);
+			if(fingers)
+			{
+				draw_finger(fingers[0], 0.9f);
+				draw_finger(fingers[1], 0.6f);
+			}
+			glDisable(GL_SCISSOR_TEST);
+		}
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 		glFinish();
 	}
 	XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 	xrReleaseSwapchainImage(r->menu_swapchain, &rel);
-	r->menu_shown_img = img;
+	r->menu_shown_img = dynamic ? -1 : img;
 }
 
 static void poll_input(XrRenderer *r, JNIEnv *env)
@@ -504,7 +594,15 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 		XrActionsSyncInfo sync = { XR_TYPE_ACTIONS_SYNC_INFO };
 		sync.countActiveActionSets = 1;
 		sync.activeActionSets = &active;
-		if(xrSyncActions(r->session, &sync) == XR_SUCCESS && !handle_menu(r))
+		bool synced = xrSyncActions(r->session, &sync) == XR_SUCCESS;
+		if(synced && handle_menu(r))
+		{
+			r->touch_mode = false;
+			r->hold_clean = false;
+			r->hold_progress = -1.0f;
+			r->finger[0] = r->finger[1] = -1;
+		}
+		else if(synced)
 		{
 			bool menu = get_bool(r, A_MENU);
 			static int dbg;
@@ -519,6 +617,50 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 			bool moon = get_bool(r, A_MOON);
 			XrVector2f ls = get_vec2(r, A_LSTICK);
 			XrVector2f rs = get_vec2(r, A_RSTICK);
+
+			// Touchpad mode: Menu held alone for TOUCH_HOLD_S. Thumbs resting on the sticks are
+			// fingers on the touchpad, stick position is the finger position, R3 clicks it.
+			bool other = cross || moon || get_bool(r, A_BOX) || get_bool(r, A_PYRAMID)
+				|| get_bool(r, A_L3) || get_bool(r, A_R3)
+				|| get_float(r, A_L1) > 0.2f || get_float(r, A_R1) > 0.2f
+				|| get_float(r, A_L2) > 0.2f || get_float(r, A_R2) > 0.2f
+				|| fabsf(ls.x) > 0.3f || fabsf(ls.y) > 0.3f || fabsf(rs.x) > 0.3f || fabsf(rs.y) > 0.3f;
+			r->hold_progress = -1.0f;
+			if(menu && !r->menu_held)
+			{
+				r->menu_down_time = now_s();
+				r->hold_clean = true;
+			}
+			if(!r->touch_mode && (other || !menu))
+				r->hold_clean = false;
+			if(menu && r->hold_clean && !r->touch_mode)
+			{
+				double held = now_s() - r->menu_down_time;
+				if(held >= TOUCH_HOLD_S)
+				{
+					r->touch_mode = true;
+					r->menu_combo = true; // no Options tap when Menu goes up
+					LOGI("Touchpad mode on");
+				}
+				else if(held >= TOUCH_HINT_S)
+					r->hold_progress = (float)((held - TOUCH_HINT_S) / (TOUCH_HOLD_S - TOUCH_HINT_S));
+			}
+			if(r->touch_mode && !menu)
+			{
+				r->touch_mode = false;
+				r->finger[0] = r->finger[1] = -1;
+				r->release_guard = true; // nothing reaches the console until everything is let go
+				LOGI("Touchpad mode off");
+			}
+			if(r->touch_mode)
+			{
+				r->finger[0] = get_bool(r, A_RTOUCH) ? pack_finger(rs) : -1;
+				r->finger[1] = get_bool(r, A_LTOUCH) ? pack_finger(ls) : -1;
+				if(get_bool(r, A_R3))
+					buttons |= BTN_TOUCHPAD;
+				r->menu_held = menu;
+				goto send;
+			}
 
 			// Menu is a modifier: Menu + A = PS, Menu + B = Share, Menu + R3 = touchpad click, Menu + right stick = D-pad.
 			// Options is only sent as a tap when Menu is released without any combo.
@@ -570,9 +712,15 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 		}
 	}
 
+send:;
+	jint f0 = r->touch_mode ? r->finger[0] : -1;
+	jint f1 = r->touch_mode ? r->finger[1] : -1;
 	if(r->mode != MODE_NONE || r->release_guard)
+	{
 		buttons = BTN_MENU_OPEN; // neutral pad, and tells Kotlin to ignore Android gamepad events
-	(*env)->CallVoidMethod(env, r->callback, r->on_input, buttons, l2, r2, lx, ly, rx, ry);
+		f0 = f1 = -1;
+	}
+	(*env)->CallVoidMethod(env, r->callback, r->on_input, buttons, l2, r2, lx, ly, rx, ry, f0, f1);
 }
 
 static void handle_state(XrRenderer *r, XrSessionState state)
@@ -774,12 +922,26 @@ static void *xr_thread(void *user)
 		uint32_t layer_count = 1;
 
 		XrCompositionLayerQuad menu = { XR_TYPE_COMPOSITION_LAYER_QUAD };
+		// Over the screen while no menu is open: touchpad overlay first, then the notice
 		int notice = r->notice;
-		bool show_notice = r->mode == MODE_NONE && notice >= 0 && notice < MENU_IMG_COUNT;
+		int ext_finger[2] = { r->ext_finger[0], r->ext_finger[1] };
+		float ext_progress = r->ext_progress;
+		int ovl_img = -1;
+		float ovl_progress = -1.0f;
+		const int *ovl_fingers = NULL;
+		if(r->mode == MODE_NONE)
+		{
+			if(r->touch_mode) { ovl_img = IMG_TOUCHPAD; ovl_fingers = r->finger; }
+			else if(r->hold_progress >= 0.0f) { ovl_img = IMG_TOUCH_HOLD; ovl_progress = r->hold_progress; }
+			else if(r->ext_active) { ovl_img = IMG_TOUCHPAD; ovl_fingers = ext_finger; }
+			else if(ext_progress >= 0.0f) { ovl_img = IMG_TOUCH_HOLD; ovl_progress = ext_progress > 1.0f ? 1.0f : ext_progress; }
+			else if(notice >= 0 && notice < MENU_IMG_COUNT) ovl_img = notice;
+		}
+		bool show_notice = ovl_img >= 0;
 		if((r->mode != MODE_NONE || show_notice) && frame_state.shouldRender && r->menu_swapchain != XR_NULL_HANDLE)
 		{
-			int img = show_notice ? notice : r->mode == MODE_RESIZE ? 5 : r->mode == MODE_MOVE ? 6 : r->menu_dir;
-			menu_draw(r, img);
+			int img = show_notice ? ovl_img : r->mode == MODE_RESIZE ? 5 : r->mode == MODE_MOVE ? 6 : r->menu_dir;
+			menu_draw_ex(r, img, show_notice ? ovl_progress : -1.0f, show_notice ? ovl_fingers : NULL);
 			menu.layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 			menu.space = r->space;
 			menu.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -832,7 +994,7 @@ JNIEXPORT jlong JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeStart(J
 	r->callback = (*env)->NewGlobalRef(env, obj);
 	jclass cls = (*env)->GetObjectClass(env, obj);
 	r->on_surface = (*env)->GetMethodID(env, cls, "onSurface", "(Landroid/view/Surface;)V");
-	r->on_input = (*env)->GetMethodID(env, cls, "onInput", "(IIISSSS)V");
+	r->on_input = (*env)->GetMethodID(env, cls, "onInput", "(IIISSSSII)V");
 	r->on_exit = (*env)->GetMethodID(env, cls, "onExit", "()V");
 	r->menu_image = (*env)->GetMethodID(env, cls, "menuImage", "(II)[B");
 	r->width = width;
@@ -841,6 +1003,10 @@ JNIEXPORT jlong JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeStart(J
 	r->screen_pose.position.z = -SCREEN_DISTANCE_M;
 	r->screen_width = SCREEN_WIDTH_M;
 	r->notice = -1;
+	r->hold_progress = -1.0f;
+	r->finger[0] = r->finger[1] = -1;
+	r->ext_progress = -1.0f;
+	r->ext_finger[0] = r->ext_finger[1] = -1;
 	r->screen_distance = SCREEN_DISTANCE_M;
 	r->egl_display = EGL_NO_DISPLAY;
 	r->egl_context = EGL_NO_CONTEXT;
@@ -860,6 +1026,17 @@ JNIEXPORT void JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeSetNotic
 	XrRenderer *r = (XrRenderer *)ptr;
 	if(r)
 		r->notice = img;
+}
+
+JNIEXPORT void JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeSetTouchOverlay(JNIEnv *env, jobject obj, jlong ptr, jfloat progress, jboolean active, jint f0, jint f1)
+{
+	XrRenderer *r = (XrRenderer *)ptr;
+	if(!r)
+		return;
+	r->ext_finger[0] = f0;
+	r->ext_finger[1] = f1;
+	r->ext_progress = progress;
+	r->ext_active = active;
 }
 
 JNIEXPORT void JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeStop(JNIEnv *env, jobject obj, jlong ptr)

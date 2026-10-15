@@ -14,7 +14,9 @@ import java.nio.ByteBuffer
 import android.os.Handler
 import android.os.Looper
 import android.view.Surface
+import android.graphics.RectF
 import com.metallic.chiaki.lib.ControllerState
+import com.metallic.chiaki.lib.ControllerTouch
 
 /**
  * Drives the native OpenXR session (xr-renderer.c). Callbacks arrive on the XR thread
@@ -37,6 +39,24 @@ class XrRenderer(
 	private val mainHandler = Handler(Looper.getMainLooper())
 	private var ptr = 0L
 	private var lastInput = ControllerState()
+	// Touch ids for the two touchpad fingers, kept while a finger stays down
+	private val touchIds = intArrayOf(-1, -1)
+	private var touchIdNext = 0
+
+	private fun touch(i: Int, packed: Int): ControllerTouch
+	{
+		if(packed < 0)
+		{
+			touchIds[i] = -1
+			return ControllerTouch()
+		}
+		if(touchIds[i] < 0)
+		{
+			touchIds[i] = touchIdNext
+			touchIdNext = (touchIdNext + 1) and 0x7f
+		}
+		return ControllerTouch((packed and 0xffff).toUShort(), (packed ushr 16).toUShort(), touchIds[i].toByte())
+	}
 
 	/** True while the secret menu is open; the activity must not forward gamepad events then */
 	@Volatile var menuOpen = false
@@ -64,6 +84,16 @@ class XrRenderer(
 		nativeSetNotice(ptr, if(i < 0) -1 else 7 + i)
 	}
 
+	/**
+	 * Touchpad overlay for gamepad touchpad mode (the Quest controllers drive it natively).
+	 * [progress] 0..1 while the hold hint shows or -1, fingers packed as x | y << 16 or -1.
+	 */
+	fun setTouchOverlay(progress: Float, active: Boolean, finger0: Int, finger1: Int)
+	{
+		if(ptr != 0L)
+			nativeSetTouchOverlay(ptr, progress, active, finger0, finger1)
+	}
+
 	@Suppress("unused") // called from native
 	private fun onSurface(surface: Surface?)
 	{
@@ -71,7 +101,7 @@ class XrRenderer(
 	}
 
 	@Suppress("unused") // called from native, once per frame
-	private fun onInput(buttons: Int, l2: Int, r2: Int, lx: Short, ly: Short, rx: Short, ry: Short)
+	private fun onInput(buttons: Int, l2: Int, r2: Int, lx: Short, ly: Short, rx: Short, ry: Short, finger0: Int, finger1: Int)
 	{
 		val open = buttons and MENU_OPEN_BIT != 0
 		if(open != menuOpen)
@@ -83,7 +113,8 @@ class XrRenderer(
 			buttons = (buttons and MENU_OPEN_BIT.inv()).toUInt(),
 			l2State = l2.coerceIn(0, 255).toUByte(),
 			r2State = r2.coerceIn(0, 255).toUByte(),
-			leftX = lx, leftY = ly, rightX = rx, rightY = ry)
+			leftX = lx, leftY = ly, rightX = rx, rightY = ry,
+			touches = arrayOf(touch(0, finger0), touch(1, finger1)))
 		if(state == lastInput)
 			return
 		lastInput = state
@@ -132,6 +163,30 @@ class XrRenderer(
 		val title = Paint(label).apply {
 			textSize = 28f * s
 			typeface = Typeface.create("sans-serif-medium", Typeface.NORMAL)
+		}
+
+		if(index == 11 || index == 12)
+		{
+			// Touchpad panel (11) and the hint shown while Menu is being held (12).
+			// Rectangles must match PANEL_* and HOLD_BAR_* in xr-renderer.c
+			c.drawRect(0f, 0f, size.toFloat(), size.toFloat(), smoke(mid, mid, mid))
+			if(index == 11)
+			{
+				val panel = RectF(56f * s, 158f * s, 456f * s, 354f * s)
+				val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.argb(40, 255, 255, 255) }
+				c.drawRoundRect(panel, 18f * s, 18f * s, fill)
+				c.drawRoundRect(panel, 18f * s, 18f * s, ring)
+				c.drawText("TOUCHPAD", mid, 128f * s, title)
+				c.drawText("Thumb on stick  ·  touch     R3  ·  click", mid, 392f * s, caption)
+				c.drawText("Release Menu to exit", mid, 422f * s, caption)
+			}
+			else
+			{
+				c.drawText("TOUCHPAD", mid, 250f * s, title)
+				c.drawRect(106f * s, 300f * s, 406f * s, 310f * s, ring)
+				c.drawText("Keep holding Menu", mid, 346f * s, caption)
+			}
+			return toBytes(bmp)
 		}
 
 		if(index >= 7)
@@ -199,4 +254,5 @@ class XrRenderer(
 	private external fun nativeStart(activity: Activity, width: Int, height: Int): Long
 	private external fun nativeStop(ptr: Long)
 	private external fun nativeSetNotice(ptr: Long, img: Int)
+	private external fun nativeSetTouchOverlay(ptr: Long, progress: Float, active: Boolean, finger0: Int, finger1: Int)
 }
