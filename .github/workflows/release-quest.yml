@@ -58,6 +58,9 @@ jobs:
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.2.13676358" "cmake;3.22.1"
 
+      - name: Install Rust Android target (room engine)
+        run: rustup target add aarch64-linux-android
+
       - name: Set up signing
         if: env.KEYSTORE_BASE64 != ''
         run: |
