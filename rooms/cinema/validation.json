@@ -1,0 +1,27 @@
+{
+  "triangles": 22894,
+  "materials": 2,
+  "texture_resolution": [
+    2048,
+    2048
+  ],
+  "glb_bytes": 3987496,
+  "screen_center": [
+    0,
+    1.4,
+    -3
+  ],
+  "screen_size": [
+    4,
+    2.25
+  ],
+  "eye": [
+    0,
+    1.2,
+    0
+  ],
+  "mask": "COLOR_0.r; G=B=0. Read R as screen-light strength, not as vertex albedo.",
+  "lighting": "Cycles combined baked; baseColorTexture; KHR_materials_unlit",
+  "runtime_lights": 0,
+  "animations": 0
+}
