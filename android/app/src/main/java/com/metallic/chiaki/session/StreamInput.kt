@@ -49,7 +49,64 @@ class StreamInput(val context: Context, val preferences: Preferences)
 		if(motionControllerState.r2State > 0U)
 			controllerState.r2State = motionControllerState.r2State
 
-		return controllerState or touchControllerState or virtualTouchState
+		val state = controllerState or touchControllerState or virtualTouchState
+		if(shaking)
+		{
+			// Side to side shake, the way a hand shakes a controller
+			val t = (android.os.SystemClock.elapsedRealtime() - shakeStart) / 1000f
+			val phase = 2f * Math.PI.toFloat() * SHAKE_HZ * t
+			state.accelX = kotlin.math.sin(phase) * SHAKE_ACCEL_G
+			state.accelY = 1f
+			state.accelZ = 0f
+			state.gyroX = 0f
+			state.gyroY = 0f
+			state.gyroZ = kotlin.math.cos(phase) * SHAKE_GYRO
+		}
+		else motionOverride?.let {
+			state.gyroX = it[0]; state.gyroY = it[1]; state.gyroZ = it[2]
+			state.accelX = it[3]; state.accelY = it[4]; state.accelZ = it[5]
+			state.orientX = it[6]; state.orientY = it[7]; state.orientZ = it[8]; state.orientW = it[9]
+		}
+		return state
+	}
+
+	/**
+	 * Motion from somewhere else than the device sensors, e.g. a VR controller:
+	 * gyro xyz (rad/s), accel xyz (g), orientation xyzw
+	 */
+	var motionOverride: FloatArray? = null
+		set(value)
+		{
+			field = value
+			controllerStateUpdated()
+		}
+
+	private var shaking = false
+	private var shakeStart = 0L
+	private val shakeTicker = object: Runnable {
+		override fun run()
+		{
+			if(!shaking)
+				return
+			controllerStateUpdated()
+			handler.postDelayed(this, 8)
+		}
+	}
+
+	/** Shakes the virtual controller for as long as [on] stays true */
+	fun setShaking(on: Boolean)
+	{
+		if(on == shaking)
+			return
+		shaking = on
+		handler.removeCallbacks(shakeTicker)
+		if(on)
+		{
+			shakeStart = android.os.SystemClock.elapsedRealtime()
+			handler.post(shakeTicker)
+		}
+		else
+			controllerStateUpdated()
 	}
 
 	private val sensorControllerState = ControllerState() // from Motion Sensors
@@ -143,6 +200,7 @@ class StreamInput(val context: Context, val preferences: Preferences)
 	// --- Touchpad mode: hold Options alone, the right stick is a finger, R3 clicks ---
 	var touchOverlayCallback: ((TouchOverlay) -> Unit)? = null
 	private var touchMode = false
+	private var shakeKey = false
 	private var holdClean = false
 	private var optionsDownTime = 0L
 	private val virtualTouchState = ControllerState()
@@ -229,6 +287,9 @@ class StreamInput(val context: Context, val preferences: Preferences)
 		private const val TOUCH_HOLD_MS = 2800L
 		private const val TOUCH_HINT_MS = 400L
 		private const val STICK_TOUCH_DEADZONE = 0.25f
+		private const val SHAKE_HZ = 7f
+		private const val SHAKE_ACCEL_G = 2.5f
+		private const val SHAKE_GYRO = 8f // rad/s
 	}
 
 	private fun handleTouchpadCombo(event: KeyEvent): Boolean
@@ -265,6 +326,26 @@ class StreamInput(val context: Context, val preferences: Preferences)
 					}
 				}
 				return true
+			}
+			KeyEvent.KEYCODE_BUTTON_THUMBL -> {
+				// Options + L3 shakes the controller while held
+				if(down && optionsHeld && !touchMode)
+				{
+					if(event.repeatCount == 0)
+					{
+						cancelHold()
+						optionsCombo = true
+						shakeKey = true
+						setShaking(true)
+					}
+					return true
+				}
+				if(!down && shakeKey)
+				{
+					shakeKey = false
+					setShaking(false)
+					return true
+				}
 			}
 			KeyEvent.KEYCODE_BUTTON_THUMBR -> {
 				if(down && optionsHeld)

@@ -132,7 +132,9 @@ class StreamActivity : AppCompatActivity()
 		if(Preferences(this).rumbleEnabled)
 		{
 			val vibrator = getSystemService(VIBRATOR_SERVICE) as Vibrator
+			val gamepadRumble = com.metallic.chiaki.session.GamepadRumble()
 			viewModel.session.rumbleState.observe(this, Observer {
+				gamepadRumble.rumble(it.left.toInt(), it.right.toInt())
 				val amplitude = min(255, (it.left.toInt() + it.right.toInt()) / 2)
 				vibrator.cancel()
 				if(amplitude == 0)
