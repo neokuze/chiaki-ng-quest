@@ -12,6 +12,8 @@ import androidx.lifecycle.Observer
 import androidx.lifecycle.ViewModelProvider
 import com.metallic.chiaki.common.ext.viewModelFactory
 import com.metallic.chiaki.lib.ConnectInfo
+import com.metallic.chiaki.common.Preferences
+import com.metallic.chiaki.session.GamepadRumble
 import com.metallic.chiaki.session.StreamStateCreateError
 import com.metallic.chiaki.session.StreamStateLoginPinRequest
 import com.metallic.chiaki.session.StreamStateQuit
@@ -29,6 +31,7 @@ class XrStreamActivity : ComponentActivity()
 
 	private lateinit var viewModel: StreamViewModel
 	private var renderer: XrRenderer? = null
+	private var motionFromController = false
 
 	override fun onCreate(savedInstanceState: Bundle?)
 	{
@@ -68,12 +71,26 @@ class XrStreamActivity : ComponentActivity()
 			}
 		})
 
+		// In VR the headset is not the controller: motion comes from the right Touch controller
+		val prefs = Preferences(this)
+		motionFromController = prefs.motionEnabled
+		if(prefs.rumbleEnabled)
+		{
+			val gamepadRumble = GamepadRumble()
+			viewModel.session.rumbleState.observe(this, Observer {
+				renderer?.setRumble(it.left.toInt(), it.right.toInt())
+				gamepadRumble.rumble(it.left.toInt(), it.right.toInt())
+			})
+		}
+
 		val profile = connectInfo.videoProfile
 		renderer = XrRenderer(this,
 			surfaceCallback = { viewModel.session.setExternalSurface(it) },
 			inputCallback = { viewModel.input.touchControllerState = it },
 			menuCallback = { viewModel.input.blocked = it },
-			exitCallback = { finish() }
+			exitCallback = { finish() },
+			motionCallback = { if(motionFromController) viewModel.input.motionOverride = it },
+			shakeCallback = { viewModel.input.setShaking(it) }
 		).also { it.start(profile.width, profile.height) }
 	}
 

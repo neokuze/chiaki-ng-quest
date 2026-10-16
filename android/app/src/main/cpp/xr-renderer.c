@@ -45,6 +45,7 @@
 #define BTN_TOUCHPAD (1 << 14)
 #define BTN_PS       (1 << 15)
 #define BTN_MENU_OPEN (1 << 30) // not a DualSense button, stripped in XrRenderer.kt
+#define BTN_SHAKE     (1 << 29) // Menu + L3 held: XrRenderer.kt shakes the virtual controller
 
 #define DPAD_THRESHOLD 0.5f
 #define OPTIONS_TAP_FRAMES 8 // ~90 ms at 90 Hz, long enough for the console to see the press
@@ -87,7 +88,8 @@ enum { MODE_NONE, MODE_MENU, MODE_RESIZE, MODE_MOVE };
 
 enum {
 	A_CROSS, A_MOON, A_BOX, A_PYRAMID, A_L3, A_R3, A_MENU,
-	A_L2, A_R2, A_L1, A_R1, A_LSTICK, A_RSTICK, A_LTOUCH, A_RTOUCH, A_COUNT
+	A_L2, A_R2, A_L1, A_R1, A_LSTICK, A_RSTICK, A_LTOUCH, A_RTOUCH,
+	A_RPOSE, A_LHAPTIC, A_RHAPTIC, A_COUNT
 };
 
 typedef struct XrRenderer
@@ -157,6 +159,16 @@ typedef struct XrRenderer
 	int pano_w, pano_h, pano_loaded; // scene index in the swapchain, -1 = none
 	bool prev_back;
 	jmethodID panorama_count, panorama_image, saved_scene, save_scene;
+
+	// Motion from the right controller, rumble on both
+	XrSpace rpose_space;
+	XrVector3f prev_velocity;
+	XrVector3f accel_filtered;
+	XrTime prev_motion_time;
+	jmethodID on_motion;
+	volatile int rumble[2]; // 0..255 from the console, left = big motor, right = small motor
+	int rumble_applied[2];
+	double rumble_time[2];
 
 	// Touchpad mode (Quest controllers)
 	double menu_down_time;
@@ -248,6 +260,9 @@ static bool input_init(XrRenderer *r)
 		{ A_RSTICK,  "rstick",  XR_ACTION_TYPE_VECTOR2F_INPUT, "/user/hand/right/input/thumbstick" },
 		{ A_LTOUCH,  "ltouch",  XR_ACTION_TYPE_BOOLEAN_INPUT, "/user/hand/left/input/thumbstick/touch" },
 		{ A_RTOUCH,  "rtouch",  XR_ACTION_TYPE_BOOLEAN_INPUT, "/user/hand/right/input/thumbstick/touch" },
+		{ A_RPOSE,   "rpose",   XR_ACTION_TYPE_POSE_INPUT,    "/user/hand/right/input/grip/pose" },
+		{ A_LHAPTIC, "lhaptic", XR_ACTION_TYPE_VIBRATION_OUTPUT, "/user/hand/left/output/haptic" },
+		{ A_RHAPTIC, "rhaptic", XR_ACTION_TYPE_VIBRATION_OUTPUT, "/user/hand/right/output/haptic" },
 	};
 
 	XrActionSuggestedBinding bindings[A_COUNT];
@@ -269,7 +284,15 @@ static bool input_init(XrRenderer *r)
 	XrSessionActionSetsAttachInfo attach = { XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO };
 	attach.countActionSets = 1;
 	attach.actionSets = &r->action_set;
-	return XR_SUCCEEDED(xrAttachSessionActionSets(r->session, &attach));
+	if(XR_FAILED(xrAttachSessionActionSets(r->session, &attach)))
+		return false;
+
+	XrActionSpaceCreateInfo space_info = { XR_TYPE_ACTION_SPACE_CREATE_INFO };
+	space_info.action = r->actions[A_RPOSE];
+	space_info.poseInActionSpace.orientation.w = 1.0f;
+	if(XR_FAILED(xrCreateActionSpace(r->session, &space_info, &r->rpose_space)))
+		LOGE("Right controller pose space failed, no motion from the controller");
+	return true;
 }
 
 static bool get_bool(XrRenderer *r, int idx)
@@ -777,6 +800,97 @@ static void menu_draw_ex(XrRenderer *r, int img, float progress, const int *fing
 	r->menu_shown_img = dynamic ? -1 : img;
 }
 
+static XrVector3f quat_rotate(XrQuaternionf q, XrVector3f v)
+{
+	// v' = q * v * q^-1, expanded
+	XrVector3f u = { q.x, q.y, q.z };
+	float s = q.w;
+	float dot_uv = u.x * v.x + u.y * v.y + u.z * v.z;
+	float dot_uu = u.x * u.x + u.y * u.y + u.z * u.z;
+	XrVector3f cross = { u.y * v.z - u.z * v.y, u.z * v.x - u.x * v.z, u.x * v.y - u.y * v.x };
+	XrVector3f out = {
+		2.0f * dot_uv * u.x + (s * s - dot_uu) * v.x + 2.0f * s * cross.x,
+		2.0f * dot_uv * u.y + (s * s - dot_uu) * v.y + 2.0f * s * cross.y,
+		2.0f * dot_uv * u.z + (s * s - dot_uu) * v.z + 2.0f * s * cross.z
+	};
+	return out;
+}
+
+#define GRAVITY 9.80665f
+
+// The right controller as the DualSense motion sensor: gyro in rad/s and accelerometer in g,
+// both in the controller's own frame (x right, y up, z toward the player), plus its orientation
+static void motion_update(XrRenderer *r, JNIEnv *env)
+{
+	if(r->rpose_space == XR_NULL_HANDLE || !frame_time || !r->on_motion)
+		return;
+	XrSpaceVelocity vel = { XR_TYPE_SPACE_VELOCITY };
+	XrSpaceLocation loc = { XR_TYPE_SPACE_LOCATION, &vel };
+	if(XR_FAILED(xrLocateSpace(r->rpose_space, r->space, frame_time, &loc))
+			|| !(loc.locationFlags & XR_SPACE_LOCATION_ORIENTATION_VALID_BIT)
+			|| !(vel.velocityFlags & XR_SPACE_VELOCITY_ANGULAR_VALID_BIT))
+		return;
+	XrQuaternionf q = loc.pose.orientation;
+	XrQuaternionf qi = { -q.x, -q.y, -q.z, q.w };
+	XrVector3f gyro = quat_rotate(qi, vel.angularVelocity);
+
+	XrVector3f accel_world = { 0, 0, 0 };
+	if((vel.velocityFlags & XR_SPACE_VELOCITY_LINEAR_VALID_BIT) && r->prev_motion_time && frame_time > r->prev_motion_time)
+	{
+		float dt = (float)((frame_time - r->prev_motion_time) * 1e-9);
+		if(dt > 0.0f && dt < 0.1f)
+		{
+			accel_world.x = (vel.linearVelocity.x - r->prev_velocity.x) / dt;
+			accel_world.y = (vel.linearVelocity.y - r->prev_velocity.y) / dt;
+			accel_world.z = (vel.linearVelocity.z - r->prev_velocity.z) / dt;
+		}
+	}
+	r->prev_velocity = vel.linearVelocity;
+	r->prev_motion_time = frame_time;
+	// Differentiated velocity is noisy, smooth it a little but keep shakes sharp
+	r->accel_filtered.x += (accel_world.x - r->accel_filtered.x) * 0.5f;
+	r->accel_filtered.y += (accel_world.y - r->accel_filtered.y) * 0.5f;
+	r->accel_filtered.z += (accel_world.z - r->accel_filtered.z) * 0.5f;
+	// An accelerometer at rest reads 1 g upward
+	XrVector3f felt = { r->accel_filtered.x, r->accel_filtered.y + GRAVITY, r->accel_filtered.z };
+	XrVector3f accel = quat_rotate(qi, felt);
+
+	(*env)->CallVoidMethod(env, r->callback, r->on_motion,
+		gyro.x, gyro.y, gyro.z,
+		accel.x / GRAVITY, accel.y / GRAVITY, accel.z / GRAVITY,
+		q.x, q.y, q.z, q.w);
+}
+
+// Console rumble on the Touch controllers. Vibrations are short pulses renewed while it lasts.
+static void rumble_update(XrRenderer *r)
+{
+	if(r->action_set == XR_NULL_HANDLE)
+		return;
+	double now = now_s();
+	for(int i = 0; i < 2; i++)
+	{
+		int v = r->rumble[i];
+		XrHapticActionInfo info = { XR_TYPE_HAPTIC_ACTION_INFO };
+		info.action = r->actions[i == 0 ? A_LHAPTIC : A_RHAPTIC];
+		if(v <= 0)
+		{
+			if(r->rumble_applied[i] > 0)
+				xrStopHapticFeedback(r->session, &info);
+			r->rumble_applied[i] = 0;
+			continue;
+		}
+		if(v == r->rumble_applied[i] && now - r->rumble_time[i] < 0.08)
+			continue;
+		XrHapticVibration vib = { XR_TYPE_HAPTIC_VIBRATION };
+		vib.duration = 120000000; // 120 ms, renewed every 80 ms while the console keeps rumbling
+		vib.frequency = XR_FREQUENCY_UNSPECIFIED;
+		vib.amplitude = (float)v / 255.0f;
+		xrApplyHapticFeedback(r->session, &info, (XrHapticBaseHeader *)&vib);
+		r->rumble_applied[i] = v;
+		r->rumble_time[i] = now;
+	}
+}
+
 static void poll_input(XrRenderer *r, JNIEnv *env)
 {
 	jint buttons = 0;
@@ -866,6 +980,7 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 				if(cross) { buttons |= BTN_PS; r->menu_combo = true; }
 				if(moon) { buttons |= BTN_SHARE; r->menu_combo = true; }
 				if(get_bool(r, A_R3)) { buttons |= BTN_TOUCHPAD; r->menu_combo = true; }
+				if(get_bool(r, A_L3)) { buttons |= BTN_SHAKE; r->menu_combo = true; }
 				if(rs.y > DPAD_THRESHOLD) { buttons |= BTN_DPAD_UP; r->menu_combo = true; }
 				if(rs.y < -DPAD_THRESHOLD) { buttons |= BTN_DPAD_DOWN; r->menu_combo = true; }
 				if(rs.x < -DPAD_THRESHOLD) { buttons |= BTN_DPAD_LEFT; r->menu_combo = true; }
@@ -887,7 +1002,7 @@ static void poll_input(XrRenderer *r, JNIEnv *env)
 			}
 			if(get_bool(r, A_PYRAMID)) buttons |= BTN_PYRAMID;
 			if(get_bool(r, A_BOX)) buttons |= BTN_BOX;
-			if(get_bool(r, A_L3)) buttons |= BTN_L3;
+			if(get_bool(r, A_L3) && !menu) buttons |= BTN_L3; // Menu + L3 shakes the controller
 			if(get_bool(r, A_R3) && !menu) buttons |= BTN_R3; // Menu + R3 is the touchpad click
 			// While Menu is held the shoulders and triggers belong to the secret menu combo,
 			// so the console never sees them
@@ -1110,6 +1225,8 @@ static void *xr_thread(void *user)
 
 		frame_time = frame_state.predictedDisplayTime;
 		poll_input(r, env);
+		motion_update(r, env);
+		rumble_update(r);
 		scene_apply(r, env);
 
 		XrCompositionLayerImageLayoutFB layout = { XR_TYPE_COMPOSITION_LAYER_IMAGE_LAYOUT_FB };
@@ -1208,6 +1325,7 @@ fail:
 	(*env)->CallVoidMethod(env, r->callback, r->on_surface, NULL);
 	if(r->swapchain != XR_NULL_HANDLE) xrDestroySwapchain(r->swapchain);
 	if(r->menu_swapchain != XR_NULL_HANDLE) xrDestroySwapchain(r->menu_swapchain);
+	if(r->rpose_space != XR_NULL_HANDLE) xrDestroySpace(r->rpose_space);
 	if(r->pano_swapchain != XR_NULL_HANDLE) xrDestroySwapchain(r->pano_swapchain);
 	if(r->passthrough_layer != XR_NULL_HANDLE && r->pt_layer_destroy) r->pt_layer_destroy(r->passthrough_layer);
 	if(r->passthrough != XR_NULL_HANDLE && r->pt_destroy) r->pt_destroy(r->passthrough);
@@ -1238,6 +1356,7 @@ JNIEXPORT jlong JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeStart(J
 	r->on_exit = (*env)->GetMethodID(env, cls, "onExit", "()V");
 	r->menu_image = (*env)->GetMethodID(env, cls, "menuImage", "(II)[B");
 	r->panorama_count = (*env)->GetMethodID(env, cls, "panoramaCount", "()I");
+	r->on_motion = (*env)->GetMethodID(env, cls, "onMotion", "(FFFFFFFFFF)V");
 	r->panorama_image = (*env)->GetMethodID(env, cls, "panoramaImage", "(I)[B");
 	r->saved_scene = (*env)->GetMethodID(env, cls, "savedScene", "()I");
 	r->save_scene = (*env)->GetMethodID(env, cls, "saveScene", "(I)V");
@@ -1281,6 +1400,15 @@ JNIEXPORT void JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeSetTouch
 	r->ext_finger[1] = f1;
 	r->ext_progress = progress;
 	r->ext_active = active;
+}
+
+JNIEXPORT void JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeSetRumble(JNIEnv *env, jobject obj, jlong ptr, jint left, jint right)
+{
+	XrRenderer *r = (XrRenderer *)ptr;
+	if(!r)
+		return;
+	r->rumble[0] = left;
+	r->rumble[1] = right;
 }
 
 JNIEXPORT void JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeStop(JNIEnv *env, jobject obj, jlong ptr)

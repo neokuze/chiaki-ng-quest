@@ -31,12 +31,17 @@ class XrRenderer(
 	private val surfaceCallback: (Surface?) -> Unit,
 	private val inputCallback: (ControllerState) -> Unit,
 	private val menuCallback: (Boolean) -> Unit,
-	private val exitCallback: () -> Unit)
+	private val exitCallback: () -> Unit,
+	/** Right controller as motion sensor: gyro xyz (rad/s), accel xyz (g), orientation xyzw */
+	private val motionCallback: (FloatArray) -> Unit = {},
+	/** Menu + L3 held or released */
+	private val shakeCallback: (Boolean) -> Unit = {})
 {
 	companion object
 	{
 		init { System.loadLibrary("chiaki-jni") }
 		private const val MENU_OPEN_BIT = 1 shl 30
+		private const val SHAKE_BIT = 1 shl 29
 		private val NOTICE_RESOLUTIONS = listOf("1080p", "720p", "540p", "360p")
 		private const val PANORAMA_MAX_WIDTH = 4096
 	}
@@ -66,6 +71,7 @@ class XrRenderer(
 	/** True while the secret menu is open; the activity must not forward gamepad events then */
 	@Volatile var menuOpen = false
 		private set
+	private var shaking = false
 
 	fun start(width: Int, height: Int)
 	{
@@ -114,8 +120,14 @@ class XrRenderer(
 			menuOpen = open
 			mainHandler.post { menuCallback(open) }
 		}
+		val shake = buttons and SHAKE_BIT != 0
+		if(shake != shaking)
+		{
+			shaking = shake
+			mainHandler.post { shakeCallback(shake) }
+		}
 		val state = ControllerState(
-			buttons = (buttons and MENU_OPEN_BIT.inv()).toUInt(),
+			buttons = (buttons and (MENU_OPEN_BIT or SHAKE_BIT).inv()).toUInt(),
 			l2State = l2.coerceIn(0, 255).toUByte(),
 			r2State = r2.coerceIn(0, 255).toUByte(),
 			leftX = lx, leftY = ly, rightX = rx, rightY = ry,
@@ -124,6 +136,21 @@ class XrRenderer(
 			return
 		lastInput = state
 		mainHandler.post { inputCallback(state) }
+	}
+
+	@Suppress("unused") // called from native, once per frame
+	private fun onMotion(gx: Float, gy: Float, gz: Float, ax: Float, ay: Float, az: Float,
+		ox: Float, oy: Float, oz: Float, ow: Float)
+	{
+		val m = floatArrayOf(gx, gy, gz, ax, ay, az, ox, oy, oz, ow)
+		mainHandler.post { motionCallback(m) }
+	}
+
+	/** Console rumble for the Touch controllers, 0..255 per motor */
+	fun setRumble(left: Int, right: Int)
+	{
+		if(ptr != 0L)
+			nativeSetRumble(ptr, left, right)
 	}
 
 	@Suppress("unused") // called from native
@@ -340,5 +367,6 @@ class XrRenderer(
 	private external fun nativeStart(activity: Activity, width: Int, height: Int): Long
 	private external fun nativeStop(ptr: Long)
 	private external fun nativeSetNotice(ptr: Long, img: Int)
+	private external fun nativeSetRumble(ptr: Long, left: Int, right: Int)
 	private external fun nativeSetTouchOverlay(ptr: Long, progress: Float, active: Boolean, finger0: Int, finger1: Int)
 }
