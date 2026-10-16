@@ -297,6 +297,21 @@ class XrRenderer(
 	@Suppress("unused") // called from native
 	private fun saveScene(scene: Int) = prefs.edit().putInt("scene", scene).apply()
 
+	/** 3D rooms packaged in assets/rooms, drawn by the Rust room engine */
+	private val roomAssets: List<String> by lazy {
+		activity.assets.list("rooms")?.filter { it.endsWith(".glb") }?.sorted() ?: listOf()
+	}
+
+	@Suppress("unused") // called from native
+	private fun roomCount(): Int = roomAssets.size
+
+	@Suppress("unused") // called from native
+	private fun roomData(index: Int): ByteArray? = try
+	{
+		activity.assets.open("rooms/" + roomAssets[index]).use { it.readBytes() }
+	}
+	catch(e: Throwable) { null }
+
 	/** 8 byte header (width, height, little endian) followed by RGBA rows, top first */
 	@Suppress("unused") // called from native
 	private fun panoramaImage(index: Int): ByteArray?

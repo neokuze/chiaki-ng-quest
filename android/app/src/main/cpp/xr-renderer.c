@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <dlfcn.h>
 #include <time.h>
 #include <unistd.h>
 #include <android/log.h>
@@ -75,7 +76,17 @@
 #define HOLD_BAR_X1 406
 #define HOLD_BAR_Y0 300
 #define HOLD_BAR_Y1 310
-// Scenes behind the screen: 0 black, 1 passthrough, 2.. panoramas (XrRenderer.panoramaImage)
+#ifdef CHIAKI_ROOMS
+// Room engine (android/app/src/main/rust/rooms), linked on arm64 only
+typedef struct Room Room;
+typedef const void *(*GlLoader)(const char *name);
+Room *room_create(GlLoader loader, const uint8_t *glb, size_t len, float *screen_out);
+void room_draw(const Room *room, const float *pos, const float *quat, const float *fov, const float *tint);
+void room_destroy(Room *room);
+#endif
+
+// Scenes behind the screen: 0 black, 1 passthrough, 2.. panoramas (XrRenderer.panoramaImage),
+// then 3D rooms (XrRenderer.roomData)
 #define SCENE_BLACK 0
 #define SCENE_PASSTHROUGH 1
 #define SCENE_PANORAMA0 2
@@ -159,6 +170,20 @@ typedef struct XrRenderer
 	int pano_w, pano_h, pano_loaded; // scene index in the swapchain, -1 = none
 	bool prev_back;
 	jmethodID panorama_count, panorama_image, saved_scene, save_scene;
+	int pano_count, room_count; // rooms come after the panoramas in the scene list
+	jmethodID room_count_m, room_data_m;
+#ifdef CHIAKI_ROOMS
+	Room *room;
+	int room_loaded; // scene index of the loaded room, -1 = none
+	XrSwapchain eye_swapchain[2];
+	uint32_t eye_w[2], eye_h[2];
+	XrSwapchainImageOpenGLESKHR eye_images[2][4];
+	uint32_t eye_image_count[2];
+	GLuint eye_depth[2];
+	GLuint eye_fbo;
+	XrPosef saved_screen_pose; // placement before entering a room, restored when leaving it
+	float saved_screen_width;
+#endif
 
 	// Motion from the right controller, rumble on both
 	XrSpace rpose_space;
@@ -549,14 +574,176 @@ static void passthrough_set(XrRenderer *r, bool on)
 	r->passthrough_running = on;
 }
 
+static bool scene_is_room(XrRenderer *r, int scene)
+{
+	return scene >= SCENE_PANORAMA0 + r->pano_count;
+}
+
 static bool scene_available(XrRenderer *r, int scene)
 {
 	if(scene == SCENE_PASSTHROUGH)
 		return r->passthrough_ext;
+	if(scene_is_room(r, scene))
+	{
+#ifdef CHIAKI_ROOMS
+		return true;
+#else
+		return false;
+#endif
+	}
 	if(scene >= SCENE_PANORAMA0)
 		return r->equirect_ext;
 	return true;
 }
+
+#ifdef CHIAKI_ROOMS
+static const void *gl_loader(const char *name)
+{
+	static void *gles;
+	if(!gles)
+		gles = dlopen("libGLESv3.so", RTLD_NOW | RTLD_LOCAL);
+	void *f = gles ? dlsym(gles, name) : NULL;
+	return f ? f : (const void *)eglGetProcAddress(name);
+}
+
+// One color swapchain and depth buffer per eye, created the first time a room is shown
+static bool eyes_init(XrRenderer *r)
+{
+	if(r->eye_swapchain[0] != XR_NULL_HANDLE)
+		return true;
+	XrViewConfigurationView cfg[2] = { { XR_TYPE_VIEW_CONFIGURATION_VIEW }, { XR_TYPE_VIEW_CONFIGURATION_VIEW } };
+	uint32_t n = 0;
+	if(XR_FAILED(xrEnumerateViewConfigurationViews(r->instance, r->system, XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 2, &n, cfg)) || n != 2)
+		return false;
+	glGenFramebuffers(1, &r->eye_fbo);
+	glGenRenderbuffers(2, r->eye_depth);
+	for(int e = 0; e < 2; e++)
+	{
+		r->eye_w[e] = cfg[e].recommendedImageRectWidth;
+		r->eye_h[e] = cfg[e].recommendedImageRectHeight;
+		XrSwapchainCreateInfo info = { XR_TYPE_SWAPCHAIN_CREATE_INFO };
+		info.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+		info.format = GL_SRGB8_ALPHA8;
+		info.width = r->eye_w[e];
+		info.height = r->eye_h[e];
+		info.sampleCount = info.faceCount = info.arraySize = info.mipCount = 1;
+		XrResult res = xrCreateSwapchain(r->session, &info, &r->eye_swapchain[e]);
+		if(XR_FAILED(res))
+		{
+			info.format = GL_RGBA8;
+			res = xrCreateSwapchain(r->session, &info, &r->eye_swapchain[e]);
+		}
+		if(XR_FAILED(res))
+		{
+			LOGE("Eye swapchain failed: %d", (int)res);
+			return false;
+		}
+		for(int i = 0; i < 4; i++)
+			r->eye_images[e][i] = (XrSwapchainImageOpenGLESKHR){ XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_ES_KHR };
+		xrEnumerateSwapchainImages(r->eye_swapchain[e], 4, &r->eye_image_count[e], (XrSwapchainImageBaseHeader *)r->eye_images[e]);
+		glBindRenderbuffer(GL_RENDERBUFFER, r->eye_depth[e]);
+		glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT24, r->eye_w[e], r->eye_h[e]);
+	}
+	glBindRenderbuffer(GL_RENDERBUFFER, 0);
+	LOGI("Eye swapchains %ux%u", r->eye_w[0], r->eye_h[0]);
+	return true;
+}
+
+static void room_unload(XrRenderer *r)
+{
+	if(!r->room)
+		return;
+	room_destroy(r->room);
+	r->room = NULL;
+	r->room_loaded = -1;
+	r->screen_pose = r->saved_screen_pose;
+	r->screen_width = r->saved_screen_width;
+}
+
+static bool room_load(XrRenderer *r, JNIEnv *env, int scene)
+{
+	if(!eyes_init(r))
+		return false;
+	jbyteArray arr = (*env)->CallObjectMethod(env, r->callback, r->room_data_m, scene - SCENE_PANORAMA0 - r->pano_count);
+	if(!arr)
+		return false;
+	jsize len = (*env)->GetArrayLength(env, arr);
+	jbyte *data = (*env)->GetByteArrayElements(env, arr, NULL);
+	float screen[9];
+	Room *room = room_create(gl_loader, (const uint8_t *)data, (size_t)len, screen);
+	(*env)->ReleaseByteArrayElements(env, arr, data, JNI_ABORT);
+	(*env)->DeleteLocalRef(env, arr);
+	glBindFramebuffer(GL_FRAMEBUFFER, 0);
+	if(!room)
+		return false;
+	if(!r->room)
+	{
+		r->saved_screen_pose = r->screen_pose;
+		r->saved_screen_width = r->screen_width;
+	}
+	else
+		room_destroy(r->room);
+	r->room = room;
+	r->room_loaded = scene;
+	// The video goes exactly where the room has its screen
+	r->screen_pose.position = (XrVector3f){ screen[0], screen[1], screen[2] };
+	r->screen_pose.orientation = (XrQuaternionf){ screen[5], screen[6], screen[7], screen[8] };
+	r->screen_width = screen[3];
+	return true;
+}
+
+// Renders the room for both eyes and fills the projection layer views
+static bool room_render(XrRenderer *r, XrTime time, XrCompositionLayerProjectionView *pv)
+{
+	XrViewLocateInfo locate = { XR_TYPE_VIEW_LOCATE_INFO };
+	locate.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+	locate.displayTime = time;
+	locate.space = r->space;
+	XrViewState view_state = { XR_TYPE_VIEW_STATE };
+	XrView views[2] = { { XR_TYPE_VIEW }, { XR_TYPE_VIEW } };
+	uint32_t n = 0;
+	if(XR_FAILED(xrLocateViews(r->session, &locate, &view_state, 2, &n, views)) || n != 2
+			|| !(view_state.viewStateFlags & XR_VIEW_STATE_ORIENTATION_VALID_BIT))
+		return false;
+	const float tint[3] = { 0.0f, 0.0f, 0.0f }; // TODO: average color of the video
+	for(int e = 0; e < 2; e++)
+	{
+		uint32_t index = 0;
+		XrSwapchainImageAcquireInfo acq = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+		if(XR_FAILED(xrAcquireSwapchainImage(r->eye_swapchain[e], &acq, &index)))
+			return false;
+		XrSwapchainImageWaitInfo wait = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+		wait.timeout = XR_INFINITE_DURATION;
+		xrWaitSwapchainImage(r->eye_swapchain[e], &wait);
+		glBindFramebuffer(GL_FRAMEBUFFER, r->eye_fbo);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, r->eye_images[e][index].image, 0);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, r->eye_depth[e]);
+		glViewport(0, 0, r->eye_w[e], r->eye_h[e]);
+		glDisable(GL_SCISSOR_TEST);
+		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+		const XrPosef *pose = &views[e].pose;
+		float pos[3] = { pose->position.x, pose->position.y, pose->position.z };
+		float quat[4] = { pose->orientation.x, pose->orientation.y, pose->orientation.z, pose->orientation.w };
+		float fov[4] = { views[e].fov.angleLeft, views[e].fov.angleRight, views[e].fov.angleUp, views[e].fov.angleDown };
+		room_draw(r->room, pos, quat, fov, tint);
+		// Tiled GPUs: depth is never needed after the eye is drawn
+		const GLenum discard[] = { GL_DEPTH_ATTACHMENT };
+		glInvalidateFramebuffer(GL_FRAMEBUFFER, 1, discard);
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+		XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+		xrReleaseSwapchainImage(r->eye_swapchain[e], &rel);
+
+		pv[e] = (XrCompositionLayerProjectionView){ XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW };
+		pv[e].pose = views[e].pose;
+		pv[e].fov = views[e].fov;
+		pv[e].subImage.swapchain = r->eye_swapchain[e];
+		pv[e].subImage.imageRect.extent.width = r->eye_w[e];
+		pv[e].subImage.imageRect.extent.height = r->eye_h[e];
+	}
+	return true;
+}
+#endif
 
 // Panorama from Kotlin: 8 byte header (width, height as little endian ints), then RGBA rows top first
 static bool panorama_load(XrRenderer *r, JNIEnv *env, int scene)
@@ -651,7 +838,16 @@ static void scene_apply(XrRenderer *r, JNIEnv *env)
 		return;
 	if(!scene_available(r, r->scene))
 		r->scene = SCENE_BLACK;
-	if(r->scene >= SCENE_PANORAMA0 && r->pano_loaded != r->scene)
+#ifdef CHIAKI_ROOMS
+	if(scene_is_room(r, r->scene))
+	{
+		if(r->room_loaded != r->scene && !room_load(r, env, r->scene))
+			r->scene = SCENE_BLACK;
+	}
+	if(!scene_is_room(r, r->scene))
+		room_unload(r);
+#endif
+	if(r->scene >= SCENE_PANORAMA0 && !scene_is_room(r, r->scene) && r->pano_loaded != r->scene)
 	{
 		if(panorama_load(r, env, r->scene))
 			r->pano_loaded = r->scene;
@@ -1148,7 +1344,12 @@ static void *xr_thread(void *user)
 		LOGE("Secret menu setup failed");
 
 	passthrough_init(r);
-	r->scene_count = SCENE_PANORAMA0 + (*env)->CallIntMethod(env, r->callback, r->panorama_count);
+	r->pano_count = (*env)->CallIntMethod(env, r->callback, r->panorama_count);
+	r->room_count = (*env)->CallIntMethod(env, r->callback, r->room_count_m);
+	r->scene_count = SCENE_PANORAMA0 + r->pano_count + r->room_count;
+#ifdef CHIAKI_ROOMS
+	r->room_loaded = -1;
+#endif
 	r->scene = (*env)->CallIntMethod(env, r->callback, r->saved_scene);
 	if(r->scene < 0 || r->scene >= r->scene_count)
 		r->scene = SCENE_BLACK;
@@ -1253,13 +1454,25 @@ static void *xr_thread(void *user)
 
 		XrCompositionLayerPassthroughFB pt_layer = { XR_TYPE_COMPOSITION_LAYER_PASSTHROUGH_FB };
 		XrCompositionLayerEquirect2KHR pano = { XR_TYPE_COMPOSITION_LAYER_EQUIRECT2_KHR };
+#ifdef CHIAKI_ROOMS
+		XrCompositionLayerProjection proj = { XR_TYPE_COMPOSITION_LAYER_PROJECTION };
+		XrCompositionLayerProjectionView proj_views[2];
+		if(r->room && frame_state.shouldRender && room_render(r, frame_state.predictedDisplayTime, proj_views))
+		{
+			proj.space = r->space;
+			proj.viewCount = 2;
+			proj.views = proj_views;
+			layers[layer_count++] = (XrCompositionLayerBaseHeader *)&proj;
+		}
+		else
+#endif
 		if(r->scene_applied == SCENE_PASSTHROUGH && r->passthrough_running)
 		{
 			pt_layer.flags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 			pt_layer.layerHandle = r->passthrough_layer;
 			layers[layer_count++] = (XrCompositionLayerBaseHeader *)&pt_layer;
 		}
-		else if(r->scene_applied >= SCENE_PANORAMA0 && r->pano_swapchain != XR_NULL_HANDLE)
+		else if(r->scene_applied >= SCENE_PANORAMA0 && !scene_is_room(r, r->scene_applied) && r->pano_swapchain != XR_NULL_HANDLE)
 		{
 			pano.space = r->space;
 			pano.eyeVisibility = XR_EYE_VISIBILITY_BOTH;
@@ -1326,6 +1539,11 @@ fail:
 	if(r->swapchain != XR_NULL_HANDLE) xrDestroySwapchain(r->swapchain);
 	if(r->menu_swapchain != XR_NULL_HANDLE) xrDestroySwapchain(r->menu_swapchain);
 	if(r->rpose_space != XR_NULL_HANDLE) xrDestroySpace(r->rpose_space);
+#ifdef CHIAKI_ROOMS
+	if(r->room) room_destroy(r->room);
+	for(int e = 0; e < 2; e++)
+		if(r->eye_swapchain[e] != XR_NULL_HANDLE) xrDestroySwapchain(r->eye_swapchain[e]);
+#endif
 	if(r->pano_swapchain != XR_NULL_HANDLE) xrDestroySwapchain(r->pano_swapchain);
 	if(r->passthrough_layer != XR_NULL_HANDLE && r->pt_layer_destroy) r->pt_layer_destroy(r->passthrough_layer);
 	if(r->passthrough != XR_NULL_HANDLE && r->pt_destroy) r->pt_destroy(r->passthrough);
@@ -1357,6 +1575,8 @@ JNIEXPORT jlong JNICALL Java_com_metallic_chiaki_stream_XrRenderer_nativeStart(J
 	r->menu_image = (*env)->GetMethodID(env, cls, "menuImage", "(II)[B");
 	r->panorama_count = (*env)->GetMethodID(env, cls, "panoramaCount", "()I");
 	r->on_motion = (*env)->GetMethodID(env, cls, "onMotion", "(FFFFFFFFFF)V");
+	r->room_count_m = (*env)->GetMethodID(env, cls, "roomCount", "()I");
+	r->room_data_m = (*env)->GetMethodID(env, cls, "roomData", "(I)[B");
 	r->panorama_image = (*env)->GetMethodID(env, cls, "panoramaImage", "(I)[B");
 	r->saved_scene = (*env)->GetMethodID(env, cls, "savedScene", "()I");
 	r->save_scene = (*env)->GetMethodID(env, cls, "saveScene", "(I)V");

@@ -1,0 +1,20 @@
+[package]
+name = "rooms"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Room engine for the chiaki-ng Quest immersive app: draws a baked glTF room around the virtual screen"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+glow = "0.14"
+gltf = { version = "1.4", default-features = false, features = ["utils", "names", "KHR_materials_unlit"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = true
+codegen-units = 1
